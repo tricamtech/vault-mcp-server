@@ -8,8 +8,9 @@ from pathlib import Path
 import chromadb
 from sentence_transformers import SentenceTransformer
 
+from .catalog import build_inventory
 from .chunker import chunk_document
-from .parser import infer_domain
+from .parser import infer_domain, parse_document
 
 logger = logging.getLogger(__name__)
 
@@ -174,11 +175,48 @@ class VaultIndexer:
                 None, self._delete_files_chunks, list(deleted_files)
             )
 
-        # Index changed files in batches
-        for rel_path in to_index:
-            count = await self._index_single_file(rel_path)
-            files_processed += 1
-            total_chunks += count
+        # Index changed files: one inventory pass, chunk everything, then a
+        # single length-bucketed encode() across ALL pending chunks, then
+        # per-file upserts. (Per-file inventory+encode was O(n^2) walks plus
+        # unbounded torch allocator growth -> the 2026-07-02 OOM crash loop.)
+        if to_index:
+            inventory = build_inventory(self.vault_path)
+            pending: list[tuple[str, list]] = []
+            for rel_path in to_index:
+                canonical = inventory.resolve(rel_path) or rel_path
+                try:
+                    chunks = await loop.run_in_executor(
+                        None, chunk_document, self.vault_path, canonical
+                    )
+                except Exception as e:
+                    logger.warning("Failed to chunk %s: %s", canonical, e)
+                    files_processed += 1
+                    continue
+                if not chunks:
+                    files_processed += 1
+                    continue
+                pending.append((rel_path, chunks))
+
+            if pending:
+                all_texts = [
+                    c.embedding_text for _, chunks in pending for c in chunks
+                ]
+                all_embeddings = await loop.run_in_executor(
+                    None,
+                    lambda: self._model.encode(
+                        all_texts, batch_size=32, show_progress_bar=False
+                    ).tolist(),
+                )
+                offset = 0
+                for rel_path, chunks in pending:
+                    embs = all_embeddings[offset : offset + len(chunks)]
+                    offset += len(chunks)
+                    count = await self._index_single_file(
+                        rel_path, inventory=inventory,
+                        embeddings=embs, chunks=chunks,
+                    )
+                    files_processed += 1
+                    total_chunks += count
 
         elapsed = time.monotonic() - start
 
@@ -242,6 +280,7 @@ class VaultIndexer:
                 "content": results["documents"][0][i],
                 "score": score,
                 "start_line": meta.get("start_line", 0),
+                "sensitivity": meta.get("sensitivity", ""),
             })
 
         return output
@@ -250,13 +289,7 @@ class VaultIndexer:
 
     def _list_vault_files(self) -> list[str]:
         """List all .md files in the vault."""
-        files: list[str] = []
-        for p in sorted(self.vault_path.rglob("*.md")):
-            rel = str(p.relative_to(self.vault_path))
-            if any(part.startswith(".") or part.startswith("_") for part in Path(rel).parts):
-                continue
-            files.append(rel)
-        return files
+        return build_inventory(self.vault_path).canonical_files
 
     def _get_stored_mtimes(self) -> dict[str, float]:
         """Get file mtimes stored in ChromaDB metadata."""
@@ -285,40 +318,59 @@ class VaultIndexer:
             if results["ids"]:
                 self._collection.delete(ids=results["ids"])
 
-    async def _index_single_file(self, rel_path: str) -> int:
-        """Chunk, embed, and store a single file. Returns chunk count."""
+    async def _index_single_file(
+        self, rel_path: str, inventory=None, embeddings: list | None = None,
+        chunks: list | None = None,
+    ) -> int:
+        """Chunk, embed, and store a single file. Returns chunk count.
+
+        inventory/chunks/embeddings may be precomputed by index_all(): building
+        the inventory does a full vault walk + SHA-256 of every file, so doing
+        it per-file made a cold index O(n^2); and per-file encode() calls (each
+        a unique batch shape) grow PyTorch's CPU allocator arena without bound
+        (the 2026-07-02 OOM crash loop).
+        """
         loop = asyncio.get_event_loop()
+        if inventory is None:
+            inventory = build_inventory(self.vault_path)
+        canonical_rel_path = inventory.resolve(rel_path) or rel_path
 
         # Delete existing chunks for this file
         await loop.run_in_executor(
-            None, self._delete_files_chunks, [rel_path]
+            None, self._delete_files_chunks, [rel_path, canonical_rel_path]
         )
 
-        # Chunk the document
-        try:
-            chunks = await loop.run_in_executor(
-                None, chunk_document, self.vault_path, rel_path
-            )
-        except Exception as e:
-            logger.warning("Failed to chunk %s: %s", rel_path, e)
-            return 0
+        # Chunk the document (unless precomputed)
+        if chunks is None:
+            try:
+                chunks = await loop.run_in_executor(
+                    None, chunk_document, self.vault_path, canonical_rel_path
+                )
+            except Exception as e:
+                logger.warning("Failed to chunk %s: %s", canonical_rel_path, e)
+                return 0
 
         if not chunks:
             return 0
 
         # Get file mtime
         try:
-            file_mtime = (self.vault_path / rel_path).stat().st_mtime
+            file_mtime = (self.vault_path / canonical_rel_path).stat().st_mtime
         except OSError:
             file_mtime = 0.0
 
-        domain = infer_domain(rel_path)
+        document = parse_document(self.vault_path, canonical_rel_path)
+        domain = infer_domain(canonical_rel_path)
 
-        # Embed all chunks for this file at once
-        embedding_texts = [c.embedding_text for c in chunks]
-        embeddings = await loop.run_in_executor(
-            None, lambda: self._model.encode(embedding_texts).tolist()
-        )
+        # Embed all chunks for this file at once (unless precomputed)
+        if embeddings is None:
+            embedding_texts = [c.embedding_text for c in chunks]
+            embeddings = await loop.run_in_executor(
+                None,
+                lambda: self._model.encode(
+                    embedding_texts, batch_size=32, show_progress_bar=False
+                ).tolist(),
+            )
 
         # Prepare batch for ChromaDB
         ids: list[str] = []
@@ -326,7 +378,7 @@ class VaultIndexer:
         metadatas: list[dict] = []
 
         for i, chunk in enumerate(chunks):
-            chunk_id = f"{rel_path}::{chunk.section_header}::{i}"
+            chunk_id = f"{canonical_rel_path}::{chunk.section_header}::{i}"
             ids.append(chunk_id)
             documents.append(chunk.content)
             metadatas.append({
@@ -336,6 +388,10 @@ class VaultIndexer:
                 "file_mtime": file_mtime,
                 "start_line": chunk.start_line,
                 "domain": domain,
+                "sensitivity": document.metadata.sensitivity or "",
+                "scope": document.metadata.scope or "",
+                "tour": document.metadata.tour or "",
+                "doc_type": document.metadata.doc_type or "",
             })
 
         # Upsert to ChromaDB
