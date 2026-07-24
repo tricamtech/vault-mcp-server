@@ -1,7 +1,7 @@
 """Domain models for vault documents and metadata."""
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -10,7 +10,12 @@ class Metadata:
     status: Optional[str] = None
     created_date: Optional[str] = None
     updated_date: Optional[str] = None
-    raw: dict[str, str] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
+    doc_type: Optional[str] = None
+    scope: Optional[str] = None
+    sensitivity: Optional[str] = None
+    tour: Optional[str] = None
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

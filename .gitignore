@@ -11,3 +11,6 @@ build/
 chroma_data/
 .idea/
 .vscode/
+*.bak
+*.bak-*
+*.bak.*
