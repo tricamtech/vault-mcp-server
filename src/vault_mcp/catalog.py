@@ -59,11 +59,24 @@ def _priority(rel_path: str) -> tuple[int, int, str]:
 
 
 def _alias_priority(rel_path: str) -> tuple[int, int, str]:
-    path = rel_path.replace("\\", "/")
-    name = Path(path).name
-    if name.startswith("HANDOFF-") and path.startswith("shared/") and not path.startswith("shared/reference/"):
-        return (0, len(path), path)
-    return _priority(path)
+    """Priority for resolving a bare basename to one canonical owner.
+
+    2026-07-29 (memory-system audit IA-06): removed a HANDOFF-* special case that
+    ranked top-level ``shared/HANDOFF-*.md`` ABOVE ``shared/reference/HANDOFF-*.md``.
+    That inversion was correct when the top-level copies were the live handoffs, but
+    the tour sessions now maintain the reference/ tier and the top-level copies are
+    frozen, superseded snapshots. Effect of the old rule: vault_read("HANDOFF-BB.md")
+    returned the copy frozen 2026-06-16 (still naming Princeton NJ as the next show)
+    instead of the 66 KB file updated the same day -- and because vault write tools
+    share this resolver, writes landed on the fossil too.
+
+    Basename resolution now uses the same tier order as everything else
+    (shared/reference/ > shared/ > bob/...). Full explicit paths are unaffected:
+    every canonical file still self-resolves, so ``shared/HANDOFF-BB.md`` remains
+    readable by its full path. Verified blast radius at the time of the change was
+    exactly one alias entry (HANDOFF-BB.md), zero aliases added or removed.
+    """
+    return _priority(rel_path.replace("\\", "/"))
 
 
 def _candidate_aliases(rel_path: str) -> set[str]:
