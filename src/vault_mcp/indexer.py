@@ -15,6 +15,11 @@ from .parser import infer_domain, parse_document
 logger = logging.getLogger(__name__)
 
 
+import os
+# Minimum cosine-similarity score a chunk must reach to be returned at all.
+_MIN_SCORE = float(os.environ.get("VAULT_MIN_SCORE", "0.75"))
+
+
 class VaultIndexer:
     """Manages chunking, embedding, and semantic search over the vault."""
 
@@ -96,7 +101,14 @@ class VaultIndexer:
                     except ValueError:
                         continue
 
-                    if change_type == Change.deleted:
+                    # A delete is only honoured if the path is ACTUALLY gone.
+                    # `awatch` yields an unordered SET, so a batch containing both a
+                    # delete and an add for one path (exactly what `git reset --hard`
+                    # and any bulk edit produce) could apply the delete last and wipe
+                    # the chunks just written. Measured cost before this guard: 374 of
+                    # 834 files unsearchable, and climbing. The file stayed readable on
+                    # disk, so only search went blind -- which is why it hid for so long.
+                    if change_type == Change.deleted and not abs_path.exists():
                         logger.info("Watcher: removing %s", rel)
                         try:
                             await loop.run_in_executor(
@@ -272,6 +284,16 @@ class VaultIndexer:
             # ChromaDB cosine distance: 0 = identical, 2 = opposite
             # Convert to similarity score: 1 - (distance / 2)
             score = 1.0 - (distance / 2.0)
+
+            # RELEVANCE FLOOR (2026-07-28). Chroma always returns the top_k nearest
+            # chunks, however far away they are, so this search could NEVER say "I
+            # don't know": an audit fired a nonsense control query and got 5 confident
+            # -looking hits at 0.687-0.723, against a documented real success at 0.79.
+            # A retrieval layer that always answers is worse than one that abstains,
+            # because a caller cannot tell a real hit from noise. Tunable via
+            # VAULT_MIN_SCORE; set 0 to restore the old always-answer behaviour.
+            if score < _MIN_SCORE:
+                continue
 
             output.append({
                 "path": meta.get("doc_path", ""),
