@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import chromadb
@@ -18,6 +19,40 @@ logger = logging.getLogger(__name__)
 import os
 # Minimum cosine-similarity score a chunk must reach to be returned at all.
 _MIN_SCORE = float(os.environ.get("VAULT_MIN_SCORE", "0.75"))
+
+#: The collection semantic search reads. Never rebuilt in place — see
+#: :meth:`VaultIndexer._rebuild_into_new_collection`.
+LIVE_COLLECTION = "vault_chunks"
+#: A rebuild under construction. Worthless if interrupted, so any leftover is
+#: dropped at startup.
+REBUILD_PREFIX = "vault_chunks_rebuild"
+#: The previous live collection, between the two renames of a swap. Only ever
+#: seen by a process that crashed mid-swap; startup renames it back.
+RETIRED_PREFIX = "vault_chunks_retired"
+
+_COLLECTION_METADATA = {"hnsw:space": "cosine"}
+
+
+class RebuildFailed(RuntimeError):
+    """A forced rebuild produced nothing usable, so the old index was kept."""
+
+
+def _collection_names(client) -> list[str]:
+    """Collection names, across chroma's two shapes for ``list_collections``.
+
+    0.6 returns ``CollectionName`` — a ``str`` subclass whose ``.name`` raises
+    ``NotImplementedError`` on purpose, to push callers off the pre-0.6 API. So
+    the str check has to come FIRST; ``getattr(item, "name", item)`` looks
+    version-agnostic and blows up on exactly the version we run.
+    """
+    return [
+        str(item) if isinstance(item, str) else item.name
+        for item in client.list_collections()
+    ]
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class VaultIndexer:
@@ -39,9 +74,44 @@ class VaultIndexer:
         self._ready = False
         self._watch_task: asyncio.Task | None = None
 
+        # --- forced-rebuild state (FIX 3: the caller must be able to tell
+        # "running" from "finished" from "failed" without waiting) ---
+        self._rebuild_task: asyncio.Task | None = None
+        self._rebuild_status: dict = {
+            "state": "idle",
+            "handle": None,
+            "phase": None,
+            "started_at": None,
+            "finished_at": None,
+            "elapsed": None,
+            "files": None,
+            "chunks": None,
+            "error": None,
+        }
+        #: Non-None only while a rebuild is in flight: paths written (or deleted)
+        #: through the live collection meanwhile, replayed into the new one after
+        #: the swap so a concurrent write is not silently dropped.
+        self._rebuild_dirty: set[str] | None = None
+
     @property
     def is_ready(self) -> bool:
         return self._ready
+
+    @property
+    def rebuild_running(self) -> bool:
+        return self._rebuild_status["state"] == "running"
+
+    def rebuild_status(self) -> dict:
+        """Snapshot of the forced-rebuild state machine. Safe from any thread."""
+        return dict(self._rebuild_status)
+
+    def chunk_count(self) -> int:
+        if self._collection is None:
+            return 0
+        try:
+            return self._collection.count()
+        except Exception:  # pragma: no cover - chroma handle went away
+            return 0
 
     async def start(self):
         """Initialize ChromaDB + embedding model, then run incremental index."""
@@ -53,11 +123,7 @@ class VaultIndexer:
         )
 
         logger.info("Initializing ChromaDB at: %s", self.chroma_path)
-        client = chromadb.PersistentClient(path=str(self.chroma_path))
-        self._collection = client.get_or_create_collection(
-            name="vault_chunks",
-            metadata={"hnsw:space": "cosine"},
-        )
+        await loop.run_in_executor(None, self.open_collection)
 
         logger.info("Running initial index...")
         stats = await self.index_all(force=False)
@@ -69,6 +135,65 @@ class VaultIndexer:
 
         if self.watch_files:
             self._watch_task = asyncio.create_task(self._watch_vault())
+
+    def _client(self):
+        return chromadb.PersistentClient(path=str(self.chroma_path))
+
+    def open_collection(self):
+        """Attach to the live collection, repairing a crashed swap first.
+
+        Blocking; call from an executor. Split out of :meth:`start` so the
+        recovery path is testable and so a rebuild can reuse the same client.
+        """
+        client = self._client()
+        self._recover_collections(client)
+        self._collection = client.get_or_create_collection(
+            name=LIVE_COLLECTION,
+            metadata=dict(_COLLECTION_METADATA),
+        )
+        return self._collection
+
+    def _recover_collections(self, client):
+        """Clean up whatever a crash or an abort left behind.
+
+        Two shapes exist:
+
+        * a ``vault_chunks_rebuild_*`` collection — a rebuild that never
+          finished. It is partial by definition, so it is dropped.
+        * a ``vault_chunks_retired_*`` with no ``vault_chunks`` — the process
+          died in the microsecond between the two renames of a swap. The retired
+          collection IS the last good index, so it is renamed back rather than
+          left for a cold rebuild to replace.
+        """
+        names = _collection_names(client)
+
+        for name in names:
+            if name.startswith(REBUILD_PREFIX):
+                logger.warning("Dropping abandoned rebuild collection %s", name)
+                self._drop_collection(client, name)
+
+        retired = sorted(n for n in names if n.startswith(RETIRED_PREFIX))
+        if LIVE_COLLECTION not in names and retired:
+            newest = retired[-1]
+            logger.warning(
+                "No %s but %s exists — a swap was interrupted; restoring it",
+                LIVE_COLLECTION, newest,
+            )
+            try:
+                client.get_collection(newest).modify(name=LIVE_COLLECTION)
+            except Exception:
+                logger.exception("Failed to restore %s", newest)
+            retired = retired[:-1]
+
+        for name in retired:
+            self._drop_collection(client, name)
+
+    @staticmethod
+    def _drop_collection(client, name: str):
+        try:
+            client.delete_collection(name)
+        except Exception:
+            logger.debug("delete_collection(%s) failed (already gone?)", name)
 
     async def _watch_vault(self):
         """Background task: watch VAULT_PATH for .md changes and re-index live.
@@ -131,37 +256,37 @@ class VaultIndexer:
             logger.exception("Filesystem watcher crashed (auto-reindex disabled)")
 
     async def index_all(self, force: bool = False) -> dict:
-        """Full or incremental index of the vault.
+        """Index the vault.
 
         Args:
-            force: If True, delete collection and rebuild from scratch.
+            force: If True, rebuild every file from scratch — into a SEPARATE
+                collection that is swapped in only once it is complete and
+                verified non-empty. The live collection is never emptied first;
+                an interrupted rebuild leaves search exactly as it was.
+                If False (default), skip files whose mtime is unchanged and
+                prune chunks for files that have disappeared.
 
         Returns:
-            Stats dict with keys: files, chunks, elapsed, skipped.
+            Stats dict with keys: mode, files, chunks, skipped, deleted, elapsed.
         """
+        if force:
+            return await self._rebuild_into_new_collection()
+        return await self._index_incremental()
+
+    async def _index_incremental(self) -> dict:
+        """mtime-skipping pass over the LIVE collection (cheap, in place)."""
         start = time.monotonic()
         loop = asyncio.get_event_loop()
 
-        if force and self._collection is not None:
-            # Wipe and recreate
-            client = chromadb.PersistentClient(path=str(self.chroma_path))
-            client.delete_collection("vault_chunks")
-            self._collection = client.get_or_create_collection(
-                name="vault_chunks",
-                metadata={"hnsw:space": "cosine"},
-            )
-
-        # Get all vault .md files
-        vault_files = self._list_vault_files()
+        # Get all vault .md files. build_inventory sha256s every file in the
+        # vault, so this must not run on the event loop (it is the same stall
+        # that made every other tool wait behind an index pass).
+        vault_files = await loop.run_in_executor(None, self._list_vault_files)
 
         # Get stored mtimes from ChromaDB for incremental check
         stored_mtimes = await loop.run_in_executor(None, self._get_stored_mtimes)
 
-        files_processed = 0
         files_skipped = 0
-        total_chunks = 0
-
-        # Find files that need indexing
         to_index: list[str] = []
         current_files: set[str] = set()
 
@@ -174,7 +299,7 @@ class VaultIndexer:
                 continue
 
             stored_mtime = stored_mtimes.get(rel_path)
-            if not force and stored_mtime is not None and abs(current_mtime - stored_mtime) < 0.5:
+            if stored_mtime is not None and abs(current_mtime - stored_mtime) < 0.5:
                 files_skipped += 1
                 continue
 
@@ -187,63 +312,266 @@ class VaultIndexer:
                 None, self._delete_files_chunks, list(deleted_files)
             )
 
-        # Index changed files: one inventory pass, chunk everything, then a
-        # single length-bucketed encode() across ALL pending chunks, then
-        # per-file upserts. (Per-file inventory+encode was O(n^2) walks plus
-        # unbounded torch allocator growth -> the 2026-07-02 OOM crash loop.)
-        if to_index:
-            inventory = build_inventory(self.vault_path)
-            pending: list[tuple[str, list]] = []
-            for rel_path in to_index:
-                canonical = inventory.resolve(rel_path) or rel_path
-                try:
-                    chunks = await loop.run_in_executor(
-                        None, chunk_document, self.vault_path, canonical
-                    )
-                except Exception as e:
-                    logger.warning("Failed to chunk %s: %s", canonical, e)
-                    files_processed += 1
-                    continue
-                if not chunks:
-                    files_processed += 1
-                    continue
-                pending.append((rel_path, chunks))
-
-            if pending:
-                all_texts = [
-                    c.embedding_text for _, chunks in pending for c in chunks
-                ]
-                all_embeddings = await loop.run_in_executor(
-                    None,
-                    lambda: self._model.encode(
-                        all_texts, batch_size=32, show_progress_bar=False
-                    ).tolist(),
-                )
-                offset = 0
-                for rel_path, chunks in pending:
-                    embs = all_embeddings[offset : offset + len(chunks)]
-                    offset += len(chunks)
-                    count = await self._index_single_file(
-                        rel_path, inventory=inventory,
-                        embeddings=embs, chunks=chunks,
-                    )
-                    files_processed += 1
-                    total_chunks += count
-
-        elapsed = time.monotonic() - start
-
-        # Count total chunks in collection
-        if self._collection is not None:
-            total_in_db = self._collection.count()
-        else:
-            total_in_db = total_chunks
+        files_processed = await self._embed_and_store(to_index, self._collection)
 
         return {
+            "mode": "incremental",
             "files": files_processed,
-            "chunks": total_in_db,
+            "chunks": self.chunk_count(),
             "skipped": files_skipped,
-            "elapsed": elapsed,
+            "deleted": len(deleted_files),
+            "elapsed": time.monotonic() - start,
         }
+
+    async def _rebuild_into_new_collection(self) -> dict:
+        """Full rebuild that CANNOT blind the vault.
+
+        The 2026-07-30 outage: ``index_all(force=True)`` deleted ``vault_chunks``
+        and then re-embedded 970 files into the hole it had just made. The
+        rebuild takes ~505 s and the MCP client gives up at 300 s, so the vault
+        answered "No results found" for everything until the service was
+        restarted and had re-indexed — 8.5 minutes blind, from a call whose whole
+        purpose was to drop 12 files.
+
+        So: build into ``vault_chunks_rebuild_<ts>``, and only when it is
+        complete AND non-empty rename it over the live one. Nothing about the
+        live collection changes until that last step, which means an exception, a
+        cancellation, an OOM or a power cut all leave the previous index serving.
+        """
+        start = time.monotonic()
+        loop = asyncio.get_event_loop()
+        client = self._client()
+
+        temp_name = f"{REBUILD_PREFIX}_{int(time.time() * 1000)}"
+        previous = self._collection
+        self._rebuild_dirty = set()
+
+        def _make_temp():
+            self._drop_collection(client, temp_name)
+            return client.create_collection(
+                name=temp_name, metadata=dict(_COLLECTION_METADATA)
+            )
+
+        temp = await loop.run_in_executor(None, _make_temp)
+
+        try:
+            vault_files = await loop.run_in_executor(None, self._list_vault_files)
+            self._set_phase("chunking", files=len(vault_files))
+            files_processed = await self._embed_and_store(
+                list(vault_files), temp, report_phase=True
+            )
+
+            chunk_total = await loop.run_in_executor(None, temp.count)
+
+            # The degenerate case: a vault full of files that produced no chunks
+            # means the chunker, the model or the disk failed, NOT that the vault
+            # is empty. Swapping that in would be the outage all over again.
+            if vault_files and chunk_total == 0:
+                raise RebuildFailed(
+                    f"rebuild produced 0 chunks from {len(vault_files)} files — "
+                    "keeping the previous index"
+                )
+
+            self._set_phase("swapping")
+            await loop.run_in_executor(None, self._swap_in, client, temp_name)
+            await self._replay_dirty()
+
+            return {
+                "mode": "full-rebuild",
+                "files": files_processed,
+                "chunks": self.chunk_count(),
+                "skipped": 0,
+                "deleted": 0,
+                "elapsed": time.monotonic() - start,
+            }
+        except BaseException:
+            # BaseException, not Exception: CancelledError is the case that
+            # actually happened, and it must not skip the cleanup either.
+            logger.exception("Rebuild failed — previous index left in place")
+            self._collection = previous
+            await loop.run_in_executor(
+                None, self._drop_collection, client, temp_name
+            )
+            raise
+        finally:
+            self._rebuild_dirty = None
+
+    def _swap_in(self, client, temp_name: str):
+        """Rename the finished rebuild over the live collection. Blocking.
+
+        chromadb 0.6.3 supports ``Collection.modify(name=...)``, a metadata-only
+        rename of an existing collection — no re-embedding and no copy — so the
+        swap is two renames, not a data move. ``self._collection`` is a handle on
+        a collection *id*, so a reader holding it keeps reading the old data
+        right up until the attribute is rebound, which is a single atomic
+        assignment.
+        """
+        names = _collection_names(client)
+        retired_name = f"{RETIRED_PREFIX}_{int(time.time() * 1000)}"
+        had_live = LIVE_COLLECTION in names
+
+        if had_live:
+            client.get_collection(LIVE_COLLECTION).modify(name=retired_name)
+        client.get_collection(temp_name).modify(name=LIVE_COLLECTION)
+
+        self._collection = client.get_collection(LIVE_COLLECTION)
+
+        if had_live:
+            self._drop_collection(client, retired_name)
+
+    async def _replay_dirty(self):
+        """Re-apply writes that landed on the old collection during the rebuild.
+
+        A rebuild takes minutes; vault_write / the filesystem watcher keep
+        running. Those writes went to the collection that is now retired, so
+        without this they would vanish at the swap.
+        """
+        dirty = self._rebuild_dirty or set()
+        self._rebuild_dirty = None  # replayed writes go straight to the new one
+        if not dirty:
+            return
+        loop = asyncio.get_event_loop()
+        gone = [p for p in dirty if not (self.vault_path / p).exists()]
+        if gone:
+            await loop.run_in_executor(None, self._delete_files_chunks, gone)
+        for rel_path in sorted(dirty):
+            if rel_path in gone:
+                continue
+            try:
+                await self._index_single_file(rel_path)
+            except Exception:
+                logger.exception("Replay after swap failed for %s", rel_path)
+
+    async def _embed_and_store(
+        self, to_index: list[str], collection, report_phase: bool = False
+    ) -> int:
+        """Chunk, batch-encode and upsert a list of files into ``collection``.
+
+        One inventory pass, chunk everything, then a single length-bucketed
+        encode() across ALL pending chunks, then per-file upserts. (Per-file
+        inventory+encode was O(n^2) walks plus unbounded torch allocator growth
+        -> the 2026-07-02 OOM crash loop.)
+
+        ``report_phase`` publishes chunking/encoding/storing transitions into the
+        rebuild status. Only the rebuild path asks for it: the single batched
+        encode() is ~95% of a full pass, so a per-file counter alone reads as
+        "0/894" for seven minutes, which is the sort of ambiguous progress signal
+        this whole change exists to remove.
+        """
+        if not to_index:
+            return 0
+
+        loop = asyncio.get_event_loop()
+        files_processed = 0
+
+        inventory = await loop.run_in_executor(None, build_inventory, self.vault_path)
+        pending: list[tuple[str, list]] = []
+        for rel_path in to_index:
+            canonical = inventory.resolve(rel_path) or rel_path
+            try:
+                chunks = await loop.run_in_executor(
+                    None, chunk_document, self.vault_path, canonical
+                )
+            except Exception as e:
+                logger.warning("Failed to chunk %s: %s", canonical, e)
+                files_processed += 1
+                continue
+            if not chunks:
+                files_processed += 1
+                continue
+            pending.append((rel_path, chunks))
+
+        if pending:
+            all_texts = [c.embedding_text for _, chunks in pending for c in chunks]
+            if report_phase:
+                self._set_phase("encoding", chunks=len(all_texts))
+            all_embeddings = await loop.run_in_executor(
+                None,
+                lambda: self._model.encode(
+                    all_texts, batch_size=32, show_progress_bar=False
+                ).tolist(),
+            )
+            if report_phase:
+                self._set_phase("storing")
+            offset = 0
+            for rel_path, chunks in pending:
+                embs = all_embeddings[offset : offset + len(chunks)]
+                offset += len(chunks)
+                await self._index_single_file(
+                    rel_path, inventory=inventory,
+                    embeddings=embs, chunks=chunks,
+                    collection=collection,
+                )
+                files_processed += 1
+                if report_phase:
+                    self._bump_phase_progress(files_processed)
+
+        return files_processed
+
+    # --- Forced-rebuild task control (FIX 3) ---
+
+    async def start_rebuild(self) -> dict:
+        """Kick off a forced rebuild in the background and return immediately.
+
+        A full rebuild is ~500 s and the MCP client idle timeout is 300 s, so the
+        synchronous version could never report success over MCP even when it
+        worked — which is exactly what made the outage look like a no-op and
+        invited a retry. Callers get a handle now and poll for the outcome.
+        """
+        if self.rebuild_running:
+            status = self.rebuild_status()
+            status["already_running"] = True
+            return status
+
+        handle = f"rebuild-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+        self._rebuild_status = {
+            "state": "running",
+            "handle": handle,
+            "phase": "starting",
+            "started_at": _utcnow(),
+            "finished_at": None,
+            "elapsed": None,
+            "files": None,
+            "chunks": None,
+            "error": None,
+        }
+        self._rebuild_task = asyncio.create_task(self._run_rebuild())
+        status = self.rebuild_status()
+        status["already_running"] = False
+        return status
+
+    async def _run_rebuild(self):
+        try:
+            stats = await self.index_all(force=True)
+        except asyncio.CancelledError:
+            self._finish_rebuild("failed", error="cancelled")
+            raise
+        except BaseException as exc:
+            self._finish_rebuild("failed", error=f"{type(exc).__name__}: {exc}")
+            raise
+        self._finish_rebuild(
+            "succeeded",
+            files=stats["files"],
+            chunks=stats["chunks"],
+            elapsed=stats["elapsed"],
+        )
+        return stats
+
+    def _finish_rebuild(self, state: str, **fields):
+        self._rebuild_status.update(
+            state=state,
+            phase=None,
+            finished_at=_utcnow(),
+            **fields,
+        )
+
+    def _set_phase(self, phase: str, **fields):
+        if self._rebuild_status["state"] == "running":
+            self._rebuild_status.update(phase=phase, **fields)
+
+    def _bump_phase_progress(self, done: int):
+        if self._rebuild_status["state"] == "running":
+            self._rebuild_status["indexed"] = done
 
     async def index_file(self, rel_path: str):
         """Re-index a single file (called after vault_write/vault_edit)."""
@@ -327,22 +655,25 @@ class VaultIndexer:
                 mtimes[doc_path] = mtime
         return mtimes
 
-    def _delete_files_chunks(self, rel_paths: list[str]):
+    def _delete_files_chunks(self, rel_paths: list[str], collection=None):
         """Delete all chunks for given file paths."""
-        if self._collection is None:
+        target = collection if collection is not None else self._collection
+        if target is None:
             return
+        if collection is None and self._rebuild_dirty is not None:
+            self._rebuild_dirty.update(rel_paths)
         for rel_path in rel_paths:
             # Get IDs matching this file
-            results = self._collection.get(
+            results = target.get(
                 where={"doc_path": rel_path},
                 include=[],
             )
             if results["ids"]:
-                self._collection.delete(ids=results["ids"])
+                target.delete(ids=results["ids"])
 
     async def _index_single_file(
         self, rel_path: str, inventory=None, embeddings: list | None = None,
-        chunks: list | None = None,
+        chunks: list | None = None, collection=None,
     ) -> int:
         """Chunk, embed, and store a single file. Returns chunk count.
 
@@ -353,13 +684,27 @@ class VaultIndexer:
         (the 2026-07-02 OOM crash loop).
         """
         loop = asyncio.get_event_loop()
+        target = collection if collection is not None else self._collection
+        if target is None:
+            return 0
+        if collection is None and self._rebuild_dirty is not None:
+            # Live write during a rebuild — replayed into the new collection
+            # after the swap (see :meth:`_replay_dirty`).
+            self._rebuild_dirty.add(rel_path)
         if inventory is None:
-            inventory = build_inventory(self.vault_path)
+            # Off-loop: this is the per-write reindex path, so an inline full-vault
+            # hash here blocked every concurrent read for its duration.
+            inventory = await loop.run_in_executor(
+                None, build_inventory, self.vault_path
+            )
         canonical_rel_path = inventory.resolve(rel_path) or rel_path
 
         # Delete existing chunks for this file
         await loop.run_in_executor(
-            None, self._delete_files_chunks, [rel_path, canonical_rel_path]
+            None,
+            self._delete_files_chunks,
+            [rel_path, canonical_rel_path],
+            target,
         )
 
         # Chunk the document (unless precomputed)
@@ -419,7 +764,7 @@ class VaultIndexer:
         # Upsert to ChromaDB
         await loop.run_in_executor(
             None,
-            lambda: self._collection.upsert(
+            lambda: target.upsert(
                 ids=ids,
                 embeddings=embeddings,
                 documents=documents,

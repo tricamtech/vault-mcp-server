@@ -25,6 +25,7 @@ class VaultDocument:
     metadata: Metadata
     sections: list[str] = field(default_factory=list)  # header names
     cross_references: list[str] = field(default_factory=list)  # linked .md files
+    wiki_links: list[str] = field(default_factory=list)  # [[wiki-link]] targets, raw
 
 
 @dataclass

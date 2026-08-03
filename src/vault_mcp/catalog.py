@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,8 +91,73 @@ def _candidate_aliases(rel_path: str) -> set[str]:
     return aliases
 
 
-def build_inventory(vault_path: Path) -> VaultInventory:
-    """Scan the vault and produce canonical files plus compatibility aliases."""
+def vault_signature(vault_path: Path) -> tuple:
+    """Cheap fingerprint of the corpus: count, newest mtime, mtime sum, total bytes.
+
+    Only stats -- no reads and no hashing -- so it is safe to compute on every
+    call. :func:`build_inventory`, by contrast, sha256s every file in the vault.
+    ONE fingerprint for the whole codebase: ``linkgraph`` re-exports this one
+    rather than keeping a second copy that could drift.
+
+    Microsecond resolution on the newest mtime, plus the mtime sum, so that an
+    edit which happens to leave the byte count identical still moves the
+    fingerprint. At millisecond rounding a same-size rewrite inside the same
+    millisecond would have been invisible -- tolerable when this only fed the link
+    graph, not once it gates path resolution for reads and writes.
+    """
+    count = 0
+    newest = 0.0
+    mtime_sum = 0.0
+    total = 0
+    for root, dirs, files in os.walk(vault_path, followlinks=True):
+        dirs[:] = [d for d in dirs if not (d.startswith(".") or d.startswith("_"))]
+        for name in files:
+            if not name.endswith(".md") or name.startswith((".", "_")):
+                continue
+            try:
+                stat = (Path(root) / name).stat()
+            except OSError:
+                continue
+            count += 1
+            total += stat.st_size
+            mtime_sum += stat.st_mtime
+            newest = max(newest, stat.st_mtime)
+    return (str(vault_path), count, round(newest, 6), round(mtime_sum, 6), total)
+
+
+_cache: dict[str, tuple[tuple, VaultInventory]] = {}
+_cache_lock = threading.Lock()
+
+
+def clear_cache():
+    """Drop the memoized inventory (tests, or after a bulk corpus change)."""
+    with _cache_lock:
+        _cache.clear()
+
+
+def build_inventory(vault_path: Path, use_cache: bool = True) -> VaultInventory:
+    """Scan the vault and produce canonical files plus compatibility aliases.
+
+    MEMOIZED (2026-07-30). This is the hot path of every read and every write:
+    ``_resolve_markdown_path`` calls it once per tool call, and on the live corpus
+    (982 files) a rebuild costs ~165 ms — a walk plus a SHA-256 of every file. That
+    single call *was* the whole of vault_read's 151 ms solo latency, and because it
+    is GIL-bound Python it got worse, not better, once tool bodies started running
+    in threads (read p50 638 ms -> 1847 ms under 6 clients).
+
+    The key is :func:`vault_signature`: stat-only, ~28 ms, and already the caching
+    strategy ``linkgraph`` uses for the same corpus. Any write bumps a file's mtime
+    (and almost always the byte total), so the fingerprint moves and the next call
+    rebuilds. Pass ``use_cache=False`` for a guaranteed-fresh scan.
+    """
+    signature = vault_signature(vault_path)
+    key = str(vault_path)
+    if use_cache:
+        with _cache_lock:
+            cached = _cache.get(key)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+
     files = _list_markdown_files(vault_path)
 
     groups: dict[str, list[str]] = {}
@@ -136,8 +202,11 @@ def build_inventory(vault_path: Path) -> VaultInventory:
     for canonical in canonical_files:
         alias_map[canonical] = canonical
 
-    return VaultInventory(
+    inventory = VaultInventory(
         canonical_files=canonical_files,
         alias_map=alias_map,
         duplicate_map=duplicate_map,
     )
+    with _cache_lock:
+        _cache[key] = (signature, inventory)
+    return inventory
