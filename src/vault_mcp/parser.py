@@ -16,6 +16,16 @@ _META_RE = re.compile(r"\*\*(.+?):\*\*\s*(.+)")
 # Markdown links to .md files.
 _LINK_RE = re.compile(r"\[.*?\]\(([^)]+\.md)\)")
 
+# Obsidian-style wiki links: [[target]], [[target|alias]], [[target#Section]],
+# and embeds ![[target]]. The corpus uses these heavily and almost never with a
+# .md suffix ([[feedback_standing_deploy_auth]]), so resolution to a real file is
+# the link graph's job -- this only extracts the target text.
+# Non-greedy and newline-free so an unclosed "[[" cannot swallow the document.
+_WIKILINK_RE = re.compile(r"!?\[\[([^\[\]\n]+?)\]\]")
+
+# Inline code spans, stripped before wiki-link extraction (see _strip_code).
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
 # Header pattern.
 _HEADER_RE = re.compile(r"^(#{1,4})\s+(.+)", re.MULTILINE)
 
@@ -422,6 +432,56 @@ def extract_cross_references(content: str) -> list[str]:
     return unique
 
 
+def _strip_code(content: str) -> str:
+    """Blank out fenced code blocks and inline code spans.
+
+    Only wiki-link extraction uses this. Reason it exists: the corpus documents
+    CLI usage, and a JSON example like ``[["Header1","Header2"]]`` in a fenced
+    block is not a link -- but it parses as one, and it then shows up in the
+    dangling-link report as a missing note. Three of those were the loudest rows
+    in the first real run. Lines are preserved (blanked, not removed) so nothing
+    downstream shifts.
+    """
+    out: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in content.splitlines():
+        stripped = line.lstrip()
+        if in_fence:
+            if stripped.startswith(fence_marker):
+                in_fence = False
+            out.append("")
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = True
+            fence_marker = stripped[:3]
+            out.append("")
+            continue
+        out.append(_INLINE_CODE_RE.sub("", line))
+    return "\n".join(out)
+
+
+def extract_wiki_links(content: str) -> list[str]:
+    """Extract unique ``[[wiki-link]]`` targets, alias and anchor stripped.
+
+    This is the ONE wiki-link parser in the codebase -- the link graph reuses it
+    rather than re-implementing markdown scanning (see linkgraph module docstring).
+    ``[[note|shown text]]`` and ``[[note#Heading]]`` both yield ``note``; a bare
+    ``[[#Heading]]`` (same-document anchor) yields nothing.
+    """
+    seen: set[str] = set()
+    unique: list[str] = []
+    for raw in _WIKILINK_RE.findall(_strip_code(content)):
+        target = raw.split("|", 1)[0].split("#", 1)[0].strip()
+        if not target or "://" in target:
+            continue
+        if target in seen:
+            continue
+        seen.add(target)
+        unique.append(target)
+    return unique
+
+
 def parse_document(vault_root: Path, rel_path: str) -> VaultDocument:
     """Parse a markdown file into a VaultDocument with normalized metadata."""
     full_path = vault_root / rel_path
@@ -433,6 +493,7 @@ def parse_document(vault_root: Path, rel_path: str) -> VaultDocument:
     apply_path_inference(metadata, rel_path)
     sections = extract_sections(body)
     cross_refs = extract_cross_references(body)
+    wiki_links = extract_wiki_links(body)
 
     return VaultDocument(
         path=rel_path,
@@ -440,6 +501,7 @@ def parse_document(vault_root: Path, rel_path: str) -> VaultDocument:
         metadata=metadata,
         sections=sections,
         cross_references=cross_refs,
+        wiki_links=wiki_links,
     )
 
 
