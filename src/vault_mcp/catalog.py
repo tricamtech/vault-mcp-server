@@ -135,6 +135,23 @@ def clear_cache():
         _cache.clear()
 
 
+def cached_signature(vault_path: Path) -> tuple | None:
+    """Signature recorded by the most recent :func:`build_inventory`, or None.
+
+    For a caller that has ALREADY validated the inventory in this same operation
+    and needs to check another signature-keyed cache. Computing a fresh
+    :func:`vault_signature` costs ~83 ms on the 894-file corpus — most of a whole
+    ``vault_read`` — so paying for a second walk within one tool call is not a
+    rounding error, it is a 30% latency regression.
+
+    Deliberately does NOT re-stat: the point is to reuse a fingerprint taken
+    microseconds ago. Callers that need certainty call ``vault_signature``.
+    """
+    with _cache_lock:
+        cached = _cache.get(str(vault_path))
+        return cached[0] if cached is not None else None
+
+
 def build_inventory(vault_path: Path, use_cache: bool = True) -> VaultInventory:
     """Scan the vault and produce canonical files plus compatibility aliases.
 
