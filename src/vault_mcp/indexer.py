@@ -358,7 +358,7 @@ class VaultIndexer:
             vault_files = await loop.run_in_executor(None, self._list_vault_files)
             self._set_phase("chunking", files=len(vault_files))
             files_processed = await self._embed_and_store(
-                list(vault_files), temp, report_phase=True
+                list(vault_files), temp, report_phase=True, prune=False
             )
 
             chunk_total = await loop.run_in_executor(None, temp.count)
@@ -443,7 +443,8 @@ class VaultIndexer:
                 logger.exception("Replay after swap failed for %s", rel_path)
 
     async def _embed_and_store(
-        self, to_index: list[str], collection, report_phase: bool = False
+        self, to_index: list[str], collection, report_phase: bool = False,
+        prune: bool = True,
     ) -> int:
         """Chunk, batch-encode and upsert a list of files into ``collection``.
 
@@ -452,7 +453,15 @@ class VaultIndexer:
         inventory+encode was O(n^2) walks plus unbounded torch allocator growth
         -> the 2026-07-02 OOM crash loop.)
 
-        ``report_phase`` publishes chunking/encoding/storing transitions into the
+        ``prune=False`` skips the per-file "delete what was there before" step.
+    Only the rebuild path sets it, and only because it writes into a collection
+    that was created empty moments earlier: there is nothing to delete. That
+    delete is a metadata scan per file, and chroma keeps every collection's
+    metadata in ONE sqlite table, so during a rebuild each scan also walks the
+    8000 rows of the live collection sitting alongside — 1788 scans of a table
+    that is temporarily twice its normal size. Measured: it dominated the pass.
+
+    ``report_phase`` publishes chunking/encoding/storing transitions into the
         rebuild status. Only the rebuild path asks for it: the single batched
         encode() is ~95% of a full pass, so a per-file counter alone reads as
         "0/894" for seven minutes, which is the sort of ambiguous progress signal
@@ -500,7 +509,7 @@ class VaultIndexer:
                 await self._index_single_file(
                     rel_path, inventory=inventory,
                     embeddings=embs, chunks=chunks,
-                    collection=collection,
+                    collection=collection, prune=prune,
                 )
                 files_processed += 1
                 if report_phase:
@@ -673,7 +682,7 @@ class VaultIndexer:
 
     async def _index_single_file(
         self, rel_path: str, inventory=None, embeddings: list | None = None,
-        chunks: list | None = None, collection=None,
+        chunks: list | None = None, collection=None, prune: bool = True,
     ) -> int:
         """Chunk, embed, and store a single file. Returns chunk count.
 
@@ -699,13 +708,15 @@ class VaultIndexer:
             )
         canonical_rel_path = inventory.resolve(rel_path) or rel_path
 
-        # Delete existing chunks for this file
-        await loop.run_in_executor(
-            None,
-            self._delete_files_chunks,
-            [rel_path, canonical_rel_path],
-            target,
-        )
+        # Delete existing chunks for this file (skipped when the target
+        # collection was created empty — see _embed_and_store's `prune`).
+        if prune:
+            await loop.run_in_executor(
+                None,
+                self._delete_files_chunks,
+                [rel_path, canonical_rel_path],
+                target,
+            )
 
         # Chunk the document (unless precomputed)
         if chunks is None:

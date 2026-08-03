@@ -140,16 +140,22 @@ _cache_key: tuple = ()
 _cache_lock = threading.Lock()
 
 
-def cached_link_graph(vault_path: Path) -> LinkGraph | None:
+def cached_link_graph(vault_path: Path, signature: tuple | None = None) -> LinkGraph | None:
     """The memoized graph IF it still matches the corpus, else ``None``.
 
     For callers on a hot path that must never pay a full rebuild. Building the
-    graph parses every file in the vault (~900 of them), and the cache is keyed
-    on a corpus signature that ANY write invalidates — so a tool that calls
-    ``build_link_graph`` inline is one write away from a multi-second read.
-    ``vault_read`` uses this instead and simply omits link data on a miss.
+    graph parses every file in the vault (~900 of them, measured 4.3 s), and the
+    cache is keyed on a corpus signature that ANY write invalidates — so a tool
+    that calls ``build_link_graph`` inline is one write away from a multi-second
+    read. ``vault_read`` uses this instead and simply omits link data on a miss.
+
+    Pass ``signature`` when the caller already has a current one (see
+    ``catalog.cached_signature``): computing a fresh fingerprint is a stat walk
+    of the whole corpus, ~83 ms here, and doing it twice per read is the entire
+    cost this helper exists to avoid.
     """
-    signature = vault_signature(vault_path)
+    if signature is None:
+        signature = vault_signature(vault_path)
     with _cache_lock:
         if _cache is not None and _cache_key == signature:
             return _cache
