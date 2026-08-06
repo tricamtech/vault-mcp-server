@@ -137,6 +137,23 @@ def _iter_heading_sections(body_lines: list[str]) -> list[tuple[str, int, list[s
     return sections
 
 
+# Heading sections excluded from the semantic index.
+#
+# The pocket re-summarizer (on Bob: /root/scripts/maintenance/pocket-resummarize.py) replaces
+# Pocket API summaries -- which misattribute speakers, and were caught inventing a person
+# outright -- and preserves Pocket's original in-file under "## Summary (Pocket, unverified)"
+# as a rollback and diff signal. That copy must stay in the FILE but must NOT be searchable:
+# a search snippet does not always make the "unverified" heading obvious, so indexing it
+# doubles the wrong-attribution surface. The corrected "## Summary" is indexed as normal.
+_EXCLUDED_SECTION_MARKERS = ("(pocket, unverified)",)
+
+
+def _section_excluded(section_header: str) -> bool:
+    """True if any heading in the section path is marked unverified."""
+    parts = [part.strip().lower() for part in section_header.split(" > ")]
+    return any(marker in part for part in parts for marker in _EXCLUDED_SECTION_MARKERS)
+
+
 def chunk_document(vault_root: Path, rel_path: str) -> list[Chunk]:
     """Split a markdown file into semantically useful chunks."""
     full_path = vault_root / rel_path
@@ -156,6 +173,8 @@ def chunk_document(vault_root: Path, rel_path: str) -> list[Chunk]:
 
     chunks: list[Chunk] = []
     for section_header, start_line, lines in sections:
+        if _section_excluded(section_header):
+            continue
         for chunk_start_line, chunk_text in _split_section_lines(lines, start_line):
             if section_header and section_header != "preamble":
                 embedding_text = f"{doc_title} ({rel_path}) > {section_header}\n\n{chunk_text}"
