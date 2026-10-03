@@ -6,7 +6,7 @@ import hashlib
 import os
 import threading
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,25 @@ class VaultInventory:
         return self.alias_map.get(requested_path)
 
 
+def is_indexable(rel_path) -> bool:
+    """Single source of truth for "does this path belong in the index?".
+
+    BOTH the full walk (:func:`_list_markdown_files`) and the filesystem watcher
+    (``indexer.VaultIndexer._watch_vault``) must call this. When the two filters
+    were written separately the watcher only checked the ``.md`` suffix, so it
+    indexed ``.obsidian/``, ``_review/`` and ``_inbox.md`` -- files the walk
+    deliberately skips. The damage is not just the extra files: the index then
+    depends on HOW you got there, because the watcher adds them and the next
+    ``index_all(force=True)`` drops them again.
+    """
+    parts = PurePosixPath(str(rel_path).replace("\\", "/")).parts
+    if not parts:
+        return False
+    if not parts[-1].lower().endswith(".md"):
+        return False
+    return not any(part.startswith((".", "_")) for part in parts)
+
+
 def _list_markdown_files(vault_path: Path) -> list[str]:
     # Use os.walk with followlinks=True so symlinked subtrees (e.g. tiered
     # vault layouts pointing at curated subdirs) are included. Path.rglob
@@ -30,12 +49,11 @@ def _list_markdown_files(vault_path: Path) -> list[str]:
     for root, dirs, filenames in os.walk(vault_path, followlinks=True):
         dirs[:] = [d for d in dirs if not (d.startswith(".") or d.startswith("_"))]
         for filename in filenames:
-            if not filename.endswith(".md"):
-                continue
-            if filename.startswith(".") or filename.startswith("_"):
-                continue
             full = Path(root) / filename
-            files.append(str(full.relative_to(vault_path)))
+            rel = str(full.relative_to(vault_path))
+            if not is_indexable(rel):
+                continue
+            files.append(rel)
     return sorted(files)
 
 

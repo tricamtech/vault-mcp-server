@@ -9,7 +9,7 @@ from pathlib import Path
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-from .catalog import build_inventory
+from .catalog import build_inventory, is_indexable
 from .chunker import chunk_document
 from .parser import infer_domain, parse_document
 
@@ -94,6 +94,24 @@ class VaultIndexer:
         self._rebuild_dirty: set[str] | None = None
 
     @property
+    async def stop(self):
+        """Cancel the filesystem watcher and wait for it to actually finish.
+
+        Without this ``_watch_task`` outlives shutdown: the task keeps a
+        reference to the indexer and to an open ``awatch`` generator, so the
+        process will not exit cleanly and tests leak a pending task.
+        """
+        task = getattr(self, "_watch_task", None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._watch_task = None
+
     def is_ready(self) -> bool:
         return self._ready
 
@@ -115,7 +133,7 @@ class VaultIndexer:
 
     async def start(self):
         """Initialize ChromaDB + embedding model, then run incremental index."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         logger.info("Loading embedding model: %s", self.model_name)
         self._model = await loop.run_in_executor(
@@ -213,17 +231,18 @@ class VaultIndexer:
             return
 
         logger.info("Filesystem watcher started on %s", self.vault_path)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         try:
             async for changes in awatch(self.vault_path, recursive=True):
                 for change_type, abs_path_str in changes:
                     abs_path = Path(abs_path_str)
-                    if abs_path.suffix.lower() != ".md":
-                        continue
                     try:
                         rel = str(abs_path.relative_to(self.vault_path))
                     except ValueError:
+                        continue
+                    # Same predicate as the full walk -- see catalog.is_indexable.
+                    if not is_indexable(rel):
                         continue
 
                     # A delete is only honoured if the path is ACTUALLY gone.
@@ -276,7 +295,7 @@ class VaultIndexer:
     async def _index_incremental(self) -> dict:
         """mtime-skipping pass over the LIVE collection (cheap, in place)."""
         start = time.monotonic()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Get all vault .md files. build_inventory sha256s every file in the
         # vault, so this must not run on the event loop (it is the same stall
@@ -339,7 +358,7 @@ class VaultIndexer:
         cancellation, an OOM or a power cut all leave the previous index serving.
         """
         start = time.monotonic()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         client = self._client()
 
         temp_name = f"{REBUILD_PREFIX}_{int(time.time() * 1000)}"
@@ -430,7 +449,7 @@ class VaultIndexer:
         self._rebuild_dirty = None  # replayed writes go straight to the new one
         if not dirty:
             return
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         gone = [p for p in dirty if not (self.vault_path / p).exists()]
         if gone:
             await loop.run_in_executor(None, self._delete_files_chunks, gone)
@@ -470,7 +489,7 @@ class VaultIndexer:
         if not to_index:
             return 0
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         files_processed = 0
 
         inventory = await loop.run_in_executor(None, build_inventory, self.vault_path)
@@ -594,7 +613,7 @@ class VaultIndexer:
         if self._collection is None or self._model is None:
             return []
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Embed the query
         query_embedding = await loop.run_in_executor(
@@ -692,7 +711,7 @@ class VaultIndexer:
         a unique batch shape) grow PyTorch's CPU allocator arena without bound
         (the 2026-07-02 OOM crash loop).
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         target = collection if collection is not None else self._collection
         if target is None:
             return 0
