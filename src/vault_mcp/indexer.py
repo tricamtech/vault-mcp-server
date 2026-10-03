@@ -11,6 +11,26 @@ from sentence_transformers import SentenceTransformer
 from .chunker import chunk_document
 from .parser import infer_domain
 
+
+def is_indexable(rel_path) -> bool:
+    """Single source of truth for "does this vault-relative path belong in the index?".
+
+    Both the full walk (:meth:`VaultIndexer._list_vault_files`) and the filesystem
+    watcher (:meth:`VaultIndexer._watch_vault`) must use this. When the two filters
+    were written separately the watcher checked only the ``.md`` suffix, so it
+    indexed ``.obsidian/``, ``_review/`` and ``_inbox.md`` -- paths the walk
+    deliberately skips. The real problem is not the extra files: it is that the
+    index contents then depend on how you got there, because the watcher adds them
+    and the next ``index_all(force=True)`` drops them again.
+    """
+    parts = Path(str(rel_path)).parts
+    if not parts:
+        return False
+    if not parts[-1].lower().endswith(".md"):
+        return False
+    return not any(part.startswith((".", "_")) for part in parts)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,6 +84,24 @@ class VaultIndexer:
         if self.watch_files:
             self._watch_task = asyncio.create_task(self._watch_vault())
 
+    async def stop(self):
+        """Cancel the filesystem watcher and wait for it to finish.
+
+        Without this ``_watch_task`` outlives shutdown: it holds the indexer and an
+        open ``awatch`` generator, so the process does not exit cleanly and tests
+        leak a pending task.
+        """
+        task = self._watch_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._watch_task = None
+
     async def _watch_vault(self):
         """Background task: watch VAULT_PATH for .md changes and re-index live.
 
@@ -82,17 +120,17 @@ class VaultIndexer:
             return
 
         logger.info("Filesystem watcher started on %s", self.vault_path)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         try:
             async for changes in awatch(self.vault_path, recursive=True):
                 for change_type, abs_path_str in changes:
                     abs_path = Path(abs_path_str)
-                    if abs_path.suffix.lower() != ".md":
-                        continue
                     try:
                         rel = str(abs_path.relative_to(self.vault_path))
                     except ValueError:
+                        continue
+                    if not is_indexable(rel):
                         continue
 
                     if change_type == Change.deleted:
@@ -253,7 +291,7 @@ class VaultIndexer:
         files: list[str] = []
         for p in sorted(self.vault_path.rglob("*.md")):
             rel = str(p.relative_to(self.vault_path))
-            if any(part.startswith(".") or part.startswith("_") for part in Path(rel).parts):
+            if not is_indexable(rel):
                 continue
             files.append(rel)
         return files
