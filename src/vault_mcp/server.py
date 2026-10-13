@@ -1023,14 +1023,44 @@ def vault_dangling_links(kind: str = "wiki", limit: int = 50, source_prefix: str
     )
 
 
+def _is_thin_chunk(text: str) -> bool:
+    """True when a chunk is little more than its heading line(s)."""
+    body = " ".join(
+        line.strip() for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    return len(body) < 40
+
+
 @_tool()
 async def vault_search(query: str, top_k: int = 10) -> str:
-    """Semantic search across the vault."""
+    """Semantic search across the vault.
+
+    Returns up to top_k DIFFERENT files, best-matching section of each, with
+    its text. That text is often enough to answer; when a file has further
+    matching sections they are named, and vault_read gives the whole file.
+    """
     if not indexer.is_ready:
         return "Indexing in progress. Please try again in a few seconds."
 
     top_k = min(max(top_k, 1), 20)
-    results = await indexer.search(query, top_k)
+    # One hit per file (2026-10-13). Chunk-level top_k let a single long file
+    # fill every slot (5/5 hits from one transcript), so callers saw one source
+    # and fell back to reading files. Over-fetch, keep each file's best chunk
+    # (Chroma returns best-first), and name the file's other matching sections.
+    # A heading-only chunk ("# 3. On nyx, restore from backup") scores high
+    # because it is short, but carries no answer; it may rank the file, never
+    # stand in for it while the same file has a chunk with real text.
+    candidates = await indexer.search(query, min(top_k * 5, 100))
+    by_path: dict[str, list[dict]] = {}
+    for cand in candidates:
+        by_path.setdefault(cand["path"], []).append(cand)
+    results: list[dict] = []
+    also: dict[str, list[str]] = {}
+    for path, chunks in list(by_path.items())[:top_k]:
+        pick = next((c for c in chunks if not _is_thin_chunk(c["content"])), chunks[0])
+        results.append({**pick, "score": chunks[0]["score"]})
+        also[path] = [c["section"] or "preamble" for c in chunks if c is not pick]
     if not results:
         return "No results found."
 
@@ -1047,6 +1077,10 @@ async def vault_search(query: str, top_k: int = 10) -> str:
             meta_bits.append(f"**Sensitivity:** {result['sensitivity']}")
         parts.append("  |  ".join(meta_bits))
         parts.append(f"```markdown\n{result['content']}\n```")
+        more = list(dict.fromkeys(also[result["path"]]))
+        if more:
+            shown = ", ".join(more[:4]) + (f" (+{len(more) - 4} more)" if len(more) > 4 else "")
+            parts.append(f"_Other matching sections in this file: {shown}_")
         parts.append("")
 
     return "\n".join(parts)
