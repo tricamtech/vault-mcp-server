@@ -14,6 +14,17 @@ from .parser import (
 )
 
 _HEADING_RE = re.compile(r"^(#{1,3})\s+(.+)$")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _has_body(lines: list[str]) -> bool:
+    """True if a section holds anything besides its heading line(s).
+
+    A heading with nothing under it used to become its own chunk; being short,
+    it scored HIGH and won search slots while carrying no answer (2026-10-13).
+    The heading text is not lost: it stays in every child section's path.
+    """
+    return any(line.strip() and not _HEADING_RE.match(line) for line in lines)
 _MAX_CHUNK_CHARS = 2200
 _OVERLAP_CHARS = 280
 
@@ -113,13 +124,19 @@ def _iter_heading_sections(body_lines: list[str]) -> list[tuple[str, int, list[s
     current_lines: list[str] = []
     current_start_line = 1
 
+    # `#` lines inside a code fence are shell/python COMMENTS, not headings.
+    # Treating them as headings chopped every pasted script into fake sections
+    # ("# 3. On nyx, restore from backup" from a bash block, 2026-10-13).
+    in_fence = False
     for line_no, line in enumerate(body_lines, start=1):
-        match = _HEADING_RE.match(line)
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+        match = None if in_fence else _HEADING_RE.match(line)
         if not match:
             current_lines.append(line)
             continue
 
-        if current_lines and any(part.strip() for part in current_lines):
+        if current_lines and _has_body(current_lines):
             sections.append((current_header, current_start_line, current_lines))
 
         level = len(match.group(1))
@@ -131,7 +148,7 @@ def _iter_heading_sections(body_lines: list[str]) -> list[tuple[str, int, list[s
         current_lines = [line]
         current_start_line = line_no
 
-    if current_lines and any(part.strip() for part in current_lines):
+    if current_lines and _has_body(current_lines):
         sections.append((current_header, current_start_line, current_lines))
 
     return sections
