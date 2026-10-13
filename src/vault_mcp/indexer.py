@@ -522,17 +522,35 @@ class VaultIndexer:
             if report_phase:
                 self._set_phase("storing")
             offset = 0
+            skipped_gone = 0
             for rel_path, chunks in pending:
                 embs = all_embeddings[offset : offset + len(chunks)]
                 offset += len(chunks)
-                await self._index_single_file(
-                    rel_path, inventory=inventory,
-                    embeddings=embs, chunks=chunks,
-                    collection=collection, prune=prune,
-                )
+                # A file can VANISH between chunking and storing. On a synced vault
+                # that is routine, not exceptional: this corpus re-syncs from git
+                # every ~20 min while a full pass takes hours, so a 2026-10-07
+                # bge-base rebuild died on FileNotFoundError for a file deleted
+                # mid-run and wrote only 466 of ~13,000 chunks. One missing file
+                # must not abort the whole index. Mirrors the guard that already
+                # exists in _replay_dirty_after_swap.
+                try:
+                    await self._index_single_file(
+                        rel_path, inventory=inventory,
+                        embeddings=embs, chunks=chunks,
+                        collection=collection, prune=prune,
+                    )
+                except FileNotFoundError:
+                    skipped_gone += 1
+                    logger.warning("Skipping %s: removed from the vault mid-index", rel_path)
+                except Exception:
+                    skipped_gone += 1
+                    logger.exception("Failed to store %s; continuing", rel_path)
                 files_processed += 1
                 if report_phase:
                     self._bump_phase_progress(files_processed)
+            if skipped_gone:
+                logger.warning("Index pass completed with %d file(s) skipped "
+                               "(vanished or failed to store)", skipped_gone)
 
         return files_processed
 
