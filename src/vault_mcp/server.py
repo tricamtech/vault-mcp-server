@@ -148,9 +148,19 @@ if OAUTH_ISSUER_URL:
         pin=OAUTH_PIN,
         state_path=Path(OAUTH_STATE_PATH) if OAUTH_STATE_PATH else None,
     )
+    # The MCP endpoint is mounted at /mcp, so the PROTECTED RESOURCE is
+    # <issuer>/mcp -- not the bare origin. This matters twice:
+    #   1. the advertised "resource" must match the URL the client registered,
+    #      or the connector rejects it as a mismatch; and
+    #   2. the SDK derives the RFC 9728 path-aware metadata route from this
+    #      value (routes.py: /.well-known/oauth-protected-resource + <path>),
+    #      which is the location clients probe FIRST. With a pathless value it
+    #      only ever served the root variant and /...-resource/mcp returned 404,
+    #      so Claude/ChatGPT reported "Couldn't discover OAuth settings".
+    _resource_url = OAUTH_ISSUER_URL.rstrip("/") + "/mcp"
     _mcp_kwargs["auth"] = AuthSettings(
         issuer_url=OAUTH_ISSUER_URL,
-        resource_server_url=OAUTH_ISSUER_URL,
+        resource_server_url=_resource_url,
         client_registration_options=ClientRegistrationOptions(enabled=True),
     )
     _mcp_kwargs["auth_server_provider"] = oauth_provider
@@ -1162,6 +1172,32 @@ def main():
     """Run the MCP server with Streamable HTTP transport."""
     if oauth_provider:
         mcp._custom_starlette_routes.extend(create_approve_routes(oauth_provider))
+
+    # --- OAuth discovery compatibility shims -------------------------------
+    # Clients differ on WHERE they look for RFC 9728 protected-resource
+    # metadata, and getting it wrong is indistinguishable from "server broken":
+    #   * the SDK registers ONLY the path-aware route for a resource with a
+    #     path, so /.well-known/oauth-protected-resource (root) 404s;
+    #   * our issuer normalises to a TRAILING SLASH, so a client that
+    #     concatenates authorization_servers[0] + "/.well-known/..." requests
+    #     //.well-known/... and gets a 404.
+    # Serve every spelling. Cheap, and removes a whole class of silent failure.
+    from starlette.responses import JSONResponse as _JSONResponse
+    from starlette.routing import Route as _Route
+
+    def _resource_metadata(request):
+        return _JSONResponse({
+            "resource": _resource_url,
+            "authorization_servers": [OAUTH_ISSUER_URL.rstrip("/")],
+            "bearer_methods_supported": ["header"],
+        })
+
+    for _p in ("/.well-known/oauth-protected-resource",
+               "//.well-known/oauth-protected-resource",
+               "//.well-known/oauth-protected-resource/mcp"):
+        mcp._custom_starlette_routes.append(
+            _Route(_p, endpoint=_resource_metadata, methods=["GET"])
+        )
 
     app = mcp.streamable_http_app()
     app.add_middleware(AcceptHeaderMiddleware)
