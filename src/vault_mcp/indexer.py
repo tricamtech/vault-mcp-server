@@ -677,6 +677,7 @@ class VaultIndexer:
                 "score": score,
                 "start_line": meta.get("start_line", 0),
                 "sensitivity": meta.get("sensitivity", ""),
+                "status": meta.get("status", ""),
             })
 
         return output
@@ -807,6 +808,9 @@ class VaultIndexer:
                 "scope": document.metadata.scope or "",
                 "tour": document.metadata.tour or "",
                 "doc_type": document.metadata.doc_type or "",
+                # Freshness ranking (server._freshness_weight) demotes superseded docs.
+                "status": str(document.metadata.status or ""),
+                "updated": str(document.metadata.updated_date or ""),
             })
 
         # Upsert to ChromaDB

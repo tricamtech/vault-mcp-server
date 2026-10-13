@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import json
 import logging
 import os
 import re
@@ -20,15 +21,17 @@ import anyio
 import uvicorn
 import yaml
 from anyio import to_thread
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from . import gitstore
+from . import gitstore, lexical
 from .activity import format_activity, recent_activity
 from .auth import CfAccessBypassMiddleware, SimpleOAuthProvider, create_approve_routes
 from .catalog import build_inventory, cached_signature
+from . import indexer as indexer_module
 from .indexer import VaultIndexer
 from .linkgraph import (
     build_link_graph,
@@ -461,6 +464,32 @@ def _atomic_write(full_path: Path, content: str) -> Path:
     return target
 
 
+def _snapshot_before_overwrite(full_path: Path, new_content: str) -> str | None:
+    """Keep the previous version of a file before any tool replaces it.
+
+    git versions most of the vault, but not all of it: gitignored paths
+    (shared/web-sessions/transcripts/) and writes whose commit fails have no
+    history, so an overwrite there was unrecoverable -- and any connected
+    client (ChatGPT, Claude web) can call vault_write. Pure appends lose
+    nothing and are skipped. FAIL-CLOSED: if the old version cannot be kept,
+    the write is refused rather than overwriting silently.
+    """
+    if not full_path.exists():
+        return None
+    old = full_path.read_text(encoding="utf-8")
+    if old == new_content or new_content.startswith(old):
+        return None
+    rel = str(full_path.relative_to(VAULT_PATH))
+    dest = SNAPSHOT_DIR / f"{rel}.{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(old, encoding="utf-8")
+    except OSError as exc:
+        logger.exception("snapshot failed for %s", rel)
+        _fail(f"write refused: could not keep the previous version of {rel} ({exc})")
+    return str(dest)
+
+
 def _persist(full_path: Path, content: str, tool: str) -> tuple[str, gitstore.CommitResult]:
     """THE single write path. Every vault write tool goes through this function.
 
@@ -474,8 +503,10 @@ def _persist(full_path: Path, content: str, tool: str) -> tuple[str, gitstore.Co
       2. index  -- best effort, the fs watcher is the backstop;
       3. git    -- last, and its failure is reported, never raised.
     """
+    snapshot = _snapshot_before_overwrite(full_path, content)
     _atomic_write(full_path, content)
     rel_path = str(full_path.relative_to(VAULT_PATH))
+    _audit({"tool": tool, "path": rel_path, "chars": len(content), "snapshot": snapshot})
     _queue_reindex(rel_path)
     result = gitstore.commit_write(full_path, tool, vault_rel_path=rel_path)
     if not result.ok:
@@ -765,6 +796,7 @@ def vault_read(file_path: str) -> str:
         _fail(f"file not found: {file_path}")
 
     rel_path = str(full_path.relative_to(VAULT_PATH))
+    _audit({"tool": "vault_read", "path": rel_path})
     doc = parse_document(VAULT_PATH, rel_path)
     header = _document_header(doc, backlinks=_backlinks_for(rel_path))
     return "\n".join(header) + doc.content
@@ -774,9 +806,11 @@ def vault_read(file_path: str) -> str:
 def vault_write(file_path: str, content: str) -> str:
     """Create or overwrite a vault file."""
     full_path = _resolve_markdown_path(file_path, allow_create=True)
+    existed = full_path.exists()
 
     rel_path, git = _persist(full_path, content, "vault_write")
-    return f"Written: {rel_path} ({len(content)} chars){git.suffix()}"
+    replaced = " -- REPLACED an existing file; its previous version was kept" if existed else ""
+    return f"Written: {rel_path} ({len(content)} chars){replaced}{git.suffix()}"
 
 
 @_tool(writes=True)
@@ -1023,6 +1057,85 @@ def vault_dangling_links(kind: str = "wiki", limit: int = 50, source_prefix: str
     )
 
 
+# --- Audit log (2026-10-13) -------------------------------------------------
+# Before this the server recorded nothing about tool calls, so when ChatGPT gave
+# a weak answer there was no way to see what it searched for or what came back.
+QUERY_LOG_PATH = Path(os.environ.get("VAULT_QUERY_LOG", "/var/lib/vault-mcp/query-log.jsonl"))
+SNAPSHOT_DIR = Path(os.environ.get("VAULT_SNAPSHOT_DIR", "/var/lib/vault-mcp/snapshots"))
+_audit_lock = threading.Lock()
+
+
+def _caller() -> str:
+    """Who is calling: the OAuth client's registered name (e.g. ChatGPT), else its id."""
+    try:
+        token = get_access_token()
+    except Exception:
+        token = None
+    if token is None:
+        return "unauthenticated"
+    client = getattr(oauth_provider, "_clients", {}).get(token.client_id) if oauth_provider else None
+    name = getattr(client, "client_name", None) if client else None
+    return f"{name} ({token.client_id[:8]})" if name else token.client_id
+
+
+def _audit(event: dict) -> None:
+    """Append one JSON line per tool call. Never raises into the tool."""
+    event = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "caller": _caller(), **event}
+    try:
+        with _audit_lock:
+            QUERY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if QUERY_LOG_PATH.exists() and QUERY_LOG_PATH.stat().st_size > 20_000_000:
+                QUERY_LOG_PATH.replace(QUERY_LOG_PATH.with_name(QUERY_LOG_PATH.name + ".1"))
+            with open(QUERY_LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            os.chmod(QUERY_LOG_PATH, 0o600)
+    except Exception:
+        logger.exception("audit log write failed")
+
+
+# --- Ranking (2026-10-13) ------------------------------------------------------
+# Two channels: meaning (embeddings, gated by VAULT_MIN_SCORE) and exact words
+# (lexical.py, BM25, gated so nonsense stays quiet). Fused on a common 0..~1
+# scale, then multiplied by a freshness weight, then collapsed to one hit per file.
+_keyword_index = lexical.KeywordIndex()
+_KW_WEIGHT = float(os.environ.get("VAULT_KEYWORD_WEIGHT", "0.6"))
+_STALE_STATUSES = frozenset({"superseded", "archived", "deprecated", "retired", "obsolete", "closed"})
+_DATE_IN_PATH = re.compile(r"(20\d\d)-(\d\d)-(\d\d)")
+
+
+def _freshness_weight(path: str, status: str = "") -> float:
+    """Rank multiplier so current docs beat archived/superseded ones and old chat
+    transcripts that match about as well. It only REORDERS: nothing is dropped,
+    so asking about history still finds history."""
+    lower = path.lower()
+    weight = 1.0
+    if "/archive" in lower or "archive-" in lower or str(status).strip().lower() in _STALE_STATUSES:
+        weight *= float(os.environ.get("VAULT_ARCHIVE_WEIGHT", "0.8"))
+    if "web-sessions/transcripts/" in lower:
+        weight *= float(os.environ.get("VAULT_TRANSCRIPT_WEIGHT", "0.9"))
+    match = _DATE_IN_PATH.search(lower)
+    if match:
+        try:
+            age = (datetime.now().date() - datetime(*map(int, match.groups())).date()).days
+        except ValueError:
+            age = 0
+        if age > 120:
+            weight *= float(os.environ.get("VAULT_OLD_WEIGHT", "0.9"))
+    return weight
+
+
+async def _keyword_candidates(query: str, limit: int) -> list[dict]:
+    collection = getattr(indexer, "_collection", None)
+    if collection is None:
+        return []
+    loop = asyncio.get_running_loop()
+    if not _keyword_index.ready:
+        await loop.run_in_executor(None, _keyword_index.refresh_from, collection)
+    elif _keyword_index.stale():
+        loop.run_in_executor(None, _keyword_index.refresh_from, collection)
+    return await loop.run_in_executor(None, _keyword_index.search, query, limit)
+
+
 def _is_thin_chunk(text: str) -> bool:
     """True when a chunk is little more than its heading line(s)."""
     body = " ".join(
@@ -1036,9 +1149,12 @@ def _is_thin_chunk(text: str) -> bool:
 async def vault_search(query: str, top_k: int = 10) -> str:
     """Semantic search across the vault.
 
-    Returns up to top_k DIFFERENT files, best-matching section of each, with
-    its text. That text is often enough to answer; when a file has further
-    matching sections they are named, and vault_read gives the whole file.
+    Matches by meaning AND by exact words, so names, hosts, venues, file names
+    and IDs (e.g. "Forosoco", "ct/106", "00117") are found too. Returns up to
+    top_k DIFFERENT files, best-matching section of each, with its text --
+    often enough to answer. Current docs rank above archived/superseded ones.
+    When a file has further matching sections they are named; vault_read gives
+    the whole file.
     """
     if not indexer.is_ready:
         return "Indexing in progress. Please try again in a few seconds."
@@ -1051,16 +1167,52 @@ async def vault_search(query: str, top_k: int = 10) -> str:
     # A heading-only chunk ("# 3. On nyx, restore from backup") scores high
     # because it is short, but carries no answer; it may rank the file, never
     # stand in for it while the same file has a chunk with real text.
-    candidates = await indexer.search(query, min(top_k * 5, 100))
+    pool = min(top_k * 5, 100)
+    semantic = await indexer.search(query, pool)
+    try:
+        keyword = await _keyword_candidates(query, pool)
+    except Exception:
+        logger.exception("keyword channel failed; semantic only")
+        keyword = []
+
+    floor = getattr(indexer_module, "_MIN_SCORE", 0.0)
+    span = max(1e-6, 1.0 - floor)
+    best_kw = max((k["bm25"] for k in keyword), default=0.0) or 1.0
+    merged: dict[tuple, dict] = {}
+    for cand in semantic:
+        key = (cand["path"], cand["section"], cand["start_line"])
+        merged[key] = {**cand, "sem": cand["score"], "kw": 0.0}
+    for cand in keyword:
+        key = (cand["path"], cand["section"], cand["start_line"])
+        entry = merged.setdefault(key, {**cand, "sem": None, "kw": 0.0})
+        entry["kw"] = cand["bm25"] / best_kw
+        if not entry.get("status"):
+            entry["status"] = cand.get("status", "")
+    for entry in merged.values():
+        sem_part = ((entry["sem"] - floor) / span) if entry["sem"] is not None else 0.0
+        entry["fused"] = sem_part + _KW_WEIGHT * entry["kw"]
+
     by_path: dict[str, list[dict]] = {}
-    for cand in candidates:
-        by_path.setdefault(cand["path"], []).append(cand)
+    for entry in sorted(merged.values(), key=lambda e: e["fused"], reverse=True):
+        by_path.setdefault(entry["path"], []).append(entry)
+    ranked = sorted(
+        by_path.items(),
+        key=lambda item: item[1][0]["fused"] * _freshness_weight(item[0], item[1][0].get("status", "")),
+        reverse=True,
+    )
     results: list[dict] = []
     also: dict[str, list[str]] = {}
-    for path, chunks in list(by_path.items())[:top_k]:
+    for path, chunks in ranked[:top_k]:
         pick = next((c for c in chunks if not _is_thin_chunk(c["content"])), chunks[0])
-        results.append({**pick, "score": chunks[0]["score"]})
+        best_sem = max((c["sem"] for c in chunks if c["sem"] is not None), default=None)
+        via = "+".join(v for v, on in (("meaning", best_sem is not None), ("keyword", any(c["kw"] for c in chunks))) if on)
+        results.append({**pick, "score": best_sem, "via": via})
         also[path] = [c["section"] or "preamble" for c in chunks if c is not pick]
+    _audit({
+        "tool": "vault_search", "query": query, "top_k": top_k,
+        "semantic": len(semantic), "keyword": len(keyword),
+        "results": [{"path": r["path"], "score": round(r["score"], 3) if r["score"] is not None else None, "via": r["via"]} for r in results],
+    })
     if not results:
         return "No results found."
 
@@ -1072,7 +1224,8 @@ async def vault_search(query: str, top_k: int = 10) -> str:
             else ""
         )
         parts.append(f"### {idx}. {result['title']}{section_label}")
-        meta_bits = [f"**File:** {result['path']}", f"**Score:** {result['score']:.3f}"]
+        score_text = f"{result['score']:.3f}" if result["score"] is not None else "exact-term match"
+        meta_bits = [f"**File:** {result['path']}", f"**Score:** {score_text}", f"**Matched by:** {result['via']}"]
         if result.get("sensitivity"):
             meta_bits.append(f"**Sensitivity:** {result['sensitivity']}")
         parts.append("  |  ".join(meta_bits))
