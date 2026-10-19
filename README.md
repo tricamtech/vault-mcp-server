@@ -134,7 +134,7 @@ If you're deploying behind Cloudflare (or any proxy that buffers SSE), you may h
 | `vault_write` | Create or overwrite a file |
 | `vault_edit` | String replacement edit (like Claude's Edit tool) |
 | `vault_summary` | Dashboard: file counts by domain, active projects, recent changes |
-| `vault_search` | Semantic search — returns relevant chunks, not full files |
+| `vault_search` | Hybrid search (meaning + exact keywords) — returns relevant chunks, not full files |
 | `vault_reindex` | Force full re-index after external changes |
 
 ## Configuration
@@ -163,6 +163,7 @@ search:
 | `SERVER_PORT` | `8080` | Internal port |
 | `CHROMA_PATH` | `/app/chroma_data` | ChromaDB storage path |
 | `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers model |
+| `VAULT_KEYWORD_WEIGHT` | `0.6` | Weight of exact-keyword (BM25) matches in `vault_search`; `0` = semantic only |
 | `OAUTH_ISSUER_URL` | *(empty)* | Set to enable OAuth (e.g. `https://vault.yourdomain.com`) |
 | `OAUTH_PIN` | *(empty)* | Optional PIN for the OAuth approval page |
 

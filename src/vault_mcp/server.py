@@ -12,6 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
+from . import lexical
 from .auth import CfAccessBypassMiddleware, SimpleOAuthProvider, create_approve_routes
 from .indexer import VaultIndexer
 from .parser import (
@@ -43,6 +44,9 @@ SERVER_PORT = int(os.environ.get("SERVER_PORT", _config.get("server", {}).get("p
 _search_config = _config.get("search", {})
 CHROMA_PATH = Path(os.environ.get("CHROMA_PATH", _search_config.get("chroma_path", "/app/chroma_data")))
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", _search_config.get("model", "paraphrase-multilingual-MiniLM-L12-v2"))
+# Weight of the exact-keyword channel relative to semantic similarity in
+# vault_search. 0 disables it (semantic-only, the original behaviour).
+KEYWORD_WEIGHT = float(os.environ.get("VAULT_KEYWORD_WEIGHT", "0.6"))
 
 # OAuth (empty ISSUER_URL = disabled, for backward compatibility)
 OAUTH_ISSUER_URL = os.environ.get("OAUTH_ISSUER_URL", "")
@@ -362,13 +366,66 @@ def vault_summary() -> str:
     return "\n".join(lines_out)
 
 
+_keyword_index = lexical.KeywordIndex()
+
+
+async def _keyword_candidates(query: str, limit: int) -> list[dict]:
+    collection = indexer.collection
+    if collection is None or KEYWORD_WEIGHT <= 0:
+        return []
+    loop = asyncio.get_running_loop()
+    if not _keyword_index.ready:
+        await loop.run_in_executor(None, _keyword_index.refresh_from, collection)
+    elif _keyword_index.stale():
+        # Serve this query from the current index; refresh in the background
+        loop.run_in_executor(None, _keyword_index.refresh_from, collection)
+    return await loop.run_in_executor(None, _keyword_index.search, query, limit)
+
+
+async def _hybrid_search(query: str, limit: int) -> list[dict]:
+    """Fuse semantic and keyword hits into one best-first list of chunks.
+
+    Semantic scores are 1 - cosine_distance/2, so unrelated text already sits
+    around 0.5. They are rescaled to cosine similarity (2*score - 1, floored
+    at 0) so that a strong exact-term hit can outrank semantic noise; the best
+    keyword hit contributes KEYWORD_WEIGHT, the rest proportionally to BM25.
+    With no keyword hits the order is exactly the semantic order.
+    """
+    semantic = await indexer.search(query, limit)
+    try:
+        keyword = await _keyword_candidates(query, limit)
+    except Exception:
+        logger.exception("keyword channel failed; semantic only")
+        keyword = []
+
+    best_kw = max((k["bm25"] for k in keyword), default=0.0) or 1.0
+    merged: dict[tuple, dict] = {}
+    for cand in semantic:
+        key = (cand["path"], cand["section"], cand["start_line"])
+        merged[key] = {**cand, "kw": 0.0}
+    for cand in keyword:
+        key = (cand["path"], cand["section"], cand["start_line"])
+        entry = merged.setdefault(key, {**cand, "score": None, "kw": 0.0})
+        entry["kw"] = cand["bm25"] / best_kw
+
+    for entry in merged.values():
+        sem = max(0.0, 2 * entry["score"] - 1) if entry["score"] is not None else 0.0
+        entry["fused"] = sem + KEYWORD_WEIGHT * entry["kw"]
+        entry["via"] = "+".join(
+            name for name, on in (("meaning", entry["score"] is not None), ("keyword", entry["kw"] > 0)) if on
+        )
+
+    return sorted(merged.values(), key=lambda e: e["fused"], reverse=True)[:limit]
+
+
 @mcp.tool()
 async def vault_search(query: str, top_k: int = 10) -> str:
-    """Semantic search across the vault. Returns the most relevant chunks.
+    """Search across the vault by meaning AND exact words. Returns the most relevant chunks.
 
     Use this instead of vault_read when you don't know which file contains the
     information — it searches all documents and returns only the relevant sections,
-    saving tokens compared to reading full files.
+    saving tokens compared to reading full files. Names, hostnames, file names and
+    IDs are matched exactly, so they are found even when they carry no meaning.
 
     Args:
         query: Natural language search query (works in English and Spanish).
@@ -381,7 +438,7 @@ async def vault_search(query: str, top_k: int = 10) -> str:
         return "Indexing in progress. Please try again in a few seconds."
 
     top_k = min(max(top_k, 1), 20)
-    results = await indexer.search(query, top_k)
+    results = await _hybrid_search(query, top_k)
 
     if not results:
         return "No results found."
@@ -390,7 +447,8 @@ async def vault_search(query: str, top_k: int = 10) -> str:
     for i, r in enumerate(results, 1):
         section_label = f" > {r['section']}" if r["section"] and r["section"] != "preamble" else ""
         parts.append(f"### {i}. {r['title']}{section_label}")
-        parts.append(f"**File:** {r['path']}  |  **Score:** {r['score']:.3f}")
+        score_text = f"{r['score']:.3f}" if r["score"] is not None else "exact-term match"
+        parts.append(f"**File:** {r['path']}  |  **Score:** {score_text}  |  **Matched by:** {r['via']}")
         parts.append(f"```markdown\n{r['content']}\n```")
         parts.append("")
 

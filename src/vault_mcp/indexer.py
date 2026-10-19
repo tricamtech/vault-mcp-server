@@ -29,6 +29,11 @@ class VaultIndexer:
     def is_ready(self) -> bool:
         return self._ready
 
+    @property
+    def collection(self) -> chromadb.Collection | None:
+        """The Chroma collection holding the indexed chunks (None until started)."""
+        return self._collection
+
     async def start(self):
         """Initialize ChromaDB + embedding model, then run incremental index."""
         loop = asyncio.get_event_loop()
