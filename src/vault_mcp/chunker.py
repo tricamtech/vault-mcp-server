@@ -6,11 +6,53 @@ from pathlib import Path
 from .models import Chunk
 from .parser import parse_metadata
 
-# Split on H2 headers (## )
-_H2_SPLIT_RE = re.compile(r"(?=^## )", re.MULTILINE)
+# H2 header line (## ) and its text
+_H2_RE = re.compile(r"^## +(.+)")
 
-# Extract H2 header text
-_H2_TEXT_RE = re.compile(r"^## +(.+)", re.MULTILINE)
+# Any markdown heading line
+_HEADING_RE = re.compile(r"^#{1,6}\s")
+
+# Opening/closing line of a fenced code block
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _split_h2_sections(lines: list[str]) -> list[tuple[str, int, list[str]]]:
+    """Split lines into (header, start_line, lines) sections on H2 headers.
+
+    The first section is the preamble (header ""). `##` lines inside a fenced
+    code block are comments in the pasted code (shell, python, a markdown
+    sample), not headings: treating them as headings chopped every such
+    block into fake sections named after a code comment.
+    """
+    sections: list[tuple[str, int, list[str]]] = []
+    header = ""
+    start_line = 1
+    current: list[str] = []
+    in_fence = False
+
+    for line_no, line in enumerate(lines, start=1):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+        match = None if in_fence else _H2_RE.match(line)
+        if not match:
+            current.append(line)
+            continue
+        sections.append((header, start_line, current))
+        header = match.group(1).strip()
+        start_line = line_no
+        current = [line]
+
+    sections.append((header, start_line, current))
+    return sections
+
+
+def _has_body(lines: list[str]) -> bool:
+    """True if a section holds anything besides heading lines.
+
+    A heading with nothing under it would otherwise become its own chunk;
+    being short, it scores high in search while carrying no answer.
+    """
+    return any(line.strip() and not _HEADING_RE.match(line) for line in lines)
 
 
 def chunk_document(vault_root: Path, rel_path: str) -> list[Chunk]:
@@ -18,6 +60,7 @@ def chunk_document(vault_root: Path, rel_path: str) -> list[Chunk]:
 
     Returns one chunk per H2 section, plus a preamble chunk for content
     before the first H2. Files without H2 headers produce a single chunk.
+    Sections with no content under their heading are skipped.
     """
     full_path = vault_root / rel_path
     content = full_path.read_text(encoding="utf-8")
@@ -28,7 +71,7 @@ def chunk_document(vault_root: Path, rel_path: str) -> list[Chunk]:
     doc_title = meta.title or Path(rel_path).stem
 
     # Split on H2 boundaries
-    sections = _H2_SPLIT_RE.split(content)
+    sections = _split_h2_sections(lines)
 
     if len(sections) <= 1:
         # No H2 headers — single chunk for entire file
@@ -47,21 +90,11 @@ def chunk_document(vault_root: Path, rel_path: str) -> list[Chunk]:
         ]
 
     chunks: list[Chunk] = []
-    current_line = 1
 
-    for i, section_text in enumerate(sections):
-        text = section_text.strip()
-        if len(text) < 20:
-            current_line += section_text.count("\n") + 1
+    for header, start_line, section_lines in sections:
+        text = "\n".join(section_lines).strip()
+        if len(text) < 20 or not _has_body(section_lines):
             continue
-
-        if i == 0:
-            # Preamble — content before first H2
-            header = ""
-        else:
-            # Extract H2 header text
-            m = _H2_TEXT_RE.match(section_text)
-            header = m.group(1).strip() if m else ""
 
         # Build contextualized text for embedding
         if header:
@@ -76,10 +109,8 @@ def chunk_document(vault_root: Path, rel_path: str) -> list[Chunk]:
                 section_header=header or "preamble",
                 content=text,
                 embedding_text=embedding_text,
-                start_line=current_line,
+                start_line=start_line,
             )
         )
-
-        current_line += section_text.count("\n") + 1
 
     return chunks
