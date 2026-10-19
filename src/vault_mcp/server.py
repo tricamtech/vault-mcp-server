@@ -92,6 +92,57 @@ if ALLOWED_HOSTS:
 
 oauth_provider: SimpleOAuthProvider | None = None
 
+
+def _resource_url(issuer_url: str) -> str:
+    """The protected resource URL: the issuer origin plus the /mcp mount.
+
+    The MCP endpoint is served at /mcp, so the protected resource is
+    <issuer>/mcp, not the bare origin. This matters twice:
+      1. the advertised "resource" must match the URL the client was given,
+         or connectors reject the metadata as a mismatch; and
+      2. the SDK derives the RFC 9728 path-aware metadata route from this
+         value (/.well-known/oauth-protected-resource + <path>), which is the
+         location MCP clients probe FIRST. With a pathless value only the
+         root variant is served, /.well-known/oauth-protected-resource/mcp
+         returns 404, and clients report "Couldn't discover OAuth settings".
+    """
+    return issuer_url.rstrip("/") + "/mcp"
+
+
+def _oauth_discovery_routes(issuer_url: str) -> list:
+    """Extra spellings of the protected-resource metadata endpoint.
+
+    Clients differ on where they look for RFC 9728 metadata, and a 404 here
+    is indistinguishable from "server broken":
+      * for a resource with a path the SDK registers ONLY the path-aware
+        route, so the root /.well-known/oauth-protected-resource 404s;
+      * the issuer URL is normalised with a trailing slash, so a client that
+        concatenates authorization_servers[0] + "/.well-known/..." requests
+        //.well-known/... and gets a 404.
+    Serve every spelling with the same document.
+    """
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    resource = _resource_url(issuer_url)
+
+    def resource_metadata(request: Request) -> JSONResponse:
+        return JSONResponse({
+            "resource": resource,
+            "authorization_servers": [issuer_url.rstrip("/")],
+            "bearer_methods_supported": ["header"],
+        })
+
+    return [
+        Route(path, endpoint=resource_metadata, methods=["GET"])
+        for path in (
+            "/.well-known/oauth-protected-resource",
+            "//.well-known/oauth-protected-resource",
+            "//.well-known/oauth-protected-resource/mcp",
+        )
+    ]
+
+
 if OAUTH_ISSUER_URL:
     from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 
@@ -102,7 +153,7 @@ if OAUTH_ISSUER_URL:
     )
     _mcp_kwargs["auth"] = AuthSettings(
         issuer_url=OAUTH_ISSUER_URL,
-        resource_server_url=OAUTH_ISSUER_URL,
+        resource_server_url=_resource_url(OAUTH_ISSUER_URL),
         client_registration_options=ClientRegistrationOptions(enabled=True),
     )
     _mcp_kwargs["auth_server_provider"] = oauth_provider
@@ -442,11 +493,12 @@ class AcceptHeaderMiddleware(BaseHTTPMiddleware):
 # Entrypoint
 # ---------------------------------------------------------------------------
 
-def main():
-    """Run the MCP server with Streamable HTTP transport."""
-    # If OAuth is enabled, register approval page routes before building the app
+def create_app():
+    """Build the Starlette app for the Streamable HTTP transport."""
+    # If OAuth is enabled, register approval page + discovery routes before building the app
     if oauth_provider:
         mcp._custom_starlette_routes.extend(create_approve_routes(oauth_provider))
+        mcp._custom_starlette_routes.extend(_oauth_discovery_routes(OAUTH_ISSUER_URL))
 
     app = mcp.streamable_http_app()
     app.add_middleware(AcceptHeaderMiddleware)
@@ -467,8 +519,12 @@ def main():
             yield state
 
     app.router.lifespan_context = lifespan_with_index
+    return app
 
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+
+def main():
+    """Run the MCP server with Streamable HTTP transport."""
+    uvicorn.run(create_app(), host=SERVER_HOST, port=SERVER_PORT)
 
 
 if __name__ == "__main__":
