@@ -362,9 +362,40 @@ def vault_summary() -> str:
     return "\n".join(lines_out)
 
 
+def _is_thin_chunk(text: str) -> bool:
+    """True when a chunk is little more than its heading line(s)."""
+    body = " ".join(
+        line.strip() for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    return len(body) < 40
+
+
+def _one_hit_per_file(candidates: list[dict], top_k: int) -> list[dict]:
+    """Collapse best-first chunk hits into at most top_k hits, one per file.
+
+    Chunk-level top_k lets a single long file fill every slot, so the caller
+    sees one source and falls back to reading files. Each file is ranked by
+    its best chunk's score, and shows its best chunk that has real text: a
+    heading-only chunk scores high because it is short but carries no answer,
+    so it may rank the file, never stand in for it. The file's other matching
+    sections are returned under "also".
+    """
+    by_path: dict[str, list[dict]] = {}
+    for cand in candidates:
+        by_path.setdefault(cand["path"], []).append(cand)
+
+    results: list[dict] = []
+    for chunks in list(by_path.values())[:top_k]:
+        pick = next((c for c in chunks if not _is_thin_chunk(c["content"])), chunks[0])
+        also = [c["section"] or "preamble" for c in chunks if c is not pick]
+        results.append({**pick, "score": chunks[0]["score"], "also": list(dict.fromkeys(also))})
+    return results
+
+
 @mcp.tool()
 async def vault_search(query: str, top_k: int = 10) -> str:
-    """Semantic search across the vault. Returns the most relevant chunks.
+    """Semantic search across the vault. Returns the most relevant files.
 
     Use this instead of vault_read when you don't know which file contains the
     information — it searches all documents and returns only the relevant sections,
@@ -372,16 +403,19 @@ async def vault_search(query: str, top_k: int = 10) -> str:
 
     Args:
         query: Natural language search query (works in English and Spanish).
-        top_k: Number of results to return (default 10, max 20).
+        top_k: Number of files to return (default 10, max 20).
 
     Returns:
-        Ranked list of relevant chunks with file path, section, and content.
+        Ranked list of up to top_k different files, each with its best-matching
+        section's content and the names of its other matching sections.
     """
     if not indexer.is_ready:
         return "Indexing in progress. Please try again in a few seconds."
 
     top_k = min(max(top_k, 1), 20)
-    results = await indexer.search(query, top_k)
+    # Over-fetch chunks so that top_k distinct files survive the collapse
+    candidates = await indexer.search(query, top_k * 5)
+    results = _one_hit_per_file(candidates, top_k)
 
     if not results:
         return "No results found."
@@ -392,6 +426,10 @@ async def vault_search(query: str, top_k: int = 10) -> str:
         parts.append(f"### {i}. {r['title']}{section_label}")
         parts.append(f"**File:** {r['path']}  |  **Score:** {r['score']:.3f}")
         parts.append(f"```markdown\n{r['content']}\n```")
+        if r["also"]:
+            more = r["also"]
+            shown = ", ".join(more[:4]) + (f" (+{len(more) - 4} more)" if len(more) > 4 else "")
+            parts.append(f"_Other matching sections in this file: {shown}_")
         parts.append("")
 
     return "\n".join(parts)
