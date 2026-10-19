@@ -461,6 +461,9 @@ def _strip_code(content: str) -> str:
     return "\n".join(out)
 
 
+_NOT_A_NOTE_NAME = re.compile(r'["$={}<>^`\\]')
+
+
 def extract_wiki_links(content: str) -> list[str]:
     """Extract unique ``[[wiki-link]]`` targets, alias and anchor stripped.
 
@@ -474,6 +477,12 @@ def extract_wiki_links(content: str) -> list[str]:
     for raw in _WIKILINK_RE.findall(_strip_code(content)):
         target = raw.split("|", 1)[0].split("#", 1)[0].strip()
         if not target or "://" in target:
+            continue
+        # Bash tests (`[[ "$x" -ge 13 ]]`, `[[ ${a,,} =~ ^(y ]]`) and chat-citation
+        # markup use the same double brackets outside a recognisable code fence.
+        # Note names never contain these characters, so such a "link" is not one
+        # (4 false dangling links in imported chat transcripts, 2026-10-19).
+        if _NOT_A_NOTE_NAME.search(target):
             continue
         if target in seen:
             continue
