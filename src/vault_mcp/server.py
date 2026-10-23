@@ -469,8 +469,15 @@ def main():
     @asynccontextmanager
     async def lifespan_with_index(app_instance):
         async with original_lifespan(app_instance) as state:
-            asyncio.create_task(indexer.start())
-            yield state
+            start_task = asyncio.create_task(indexer.start())
+            try:
+                yield state
+            finally:
+                # The initial index can still be running at shutdown; cancel it
+                # first, or it would go on to start the watcher after stop().
+                start_task.cancel()
+                await asyncio.gather(start_task, return_exceptions=True)
+                await indexer.stop()
 
     app.router.lifespan_context = lifespan_with_index
 

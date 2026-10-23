@@ -7,6 +7,7 @@ from pathlib import Path
 
 import chromadb
 from sentence_transformers import SentenceTransformer
+from watchfiles import Change, awatch
 
 from .chunker import chunk_document
 from .parser import infer_domain
@@ -22,11 +23,14 @@ def is_indexable(rel_path) -> bool:
     deliberately skips. The real problem is not the extra files: it is that the
     index contents then depend on how you got there, because the watcher adds them
     and the next ``index_all(force=True)`` drops them again.
+
+    The suffix check is case-sensitive to match the walk's ``rglob("*.md")``,
+    which is case-sensitive on Linux: ``NOTES.MD`` is not indexed by either.
     """
     parts = Path(str(rel_path)).parts
     if not parts:
         return False
-    if not parts[-1].lower().endswith(".md"):
+    if not parts[-1].endswith(".md"):
         return False
     return not any(part.startswith((".", "_")) for part in parts)
 
@@ -105,20 +109,18 @@ class VaultIndexer:
     async def _watch_vault(self):
         """Background task: watch VAULT_PATH for .md changes and re-index live.
 
-        Uses watchfiles (already a transitive dep via uvicorn) to react to
-        external file changes — git pull, manual edits in Obsidian, sync
-        scripts, etc. Without this, vault-mcp's index only catches changes
-        made through its own write tools and at server startup.
-        """
-        try:
-            from watchfiles import awatch, Change
-        except ImportError:
-            logger.warning(
-                "watchfiles not installed — auto-reindex disabled. "
-                "Install with: pip install watchfiles"
-            )
-            return
+        Uses watchfiles to react to external file changes — git pull, manual
+        edits in Obsidian, sync scripts, etc. Without this, vault-mcp's index
+        only catches changes made through its own write tools and at server
+        startup.
 
+        Files written through ``vault_write``/``vault_edit`` are indexed twice:
+        the tool schedules ``index_file`` and the watcher then sees the same
+        write. That costs one redundant embed but is otherwise harmless, because
+        ``_index_single_file`` deletes the file's chunks and upserts them under
+        deterministic IDs (``path::section::n``), so both passes converge on the
+        same rows.
+        """
         logger.info("Filesystem watcher started on %s", self.vault_path)
         loop = asyncio.get_running_loop()
 
