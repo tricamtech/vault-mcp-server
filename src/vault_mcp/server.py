@@ -1408,10 +1408,20 @@ def main():
             VAULT_WRITE_SLOTS,
         )
         async with original_lifespan(app_instance) as state:
-            asyncio.create_task(indexer.start())
+            start_task = asyncio.create_task(indexer.start())
             try:
                 yield state
             finally:
+                # Stop the watcher. Cancel start() first: if shutdown lands during
+                # the initial index, start() would otherwise launch the watcher
+                # AFTER stop() had already run, leaving it orphaned.
+                if not start_task.done():
+                    start_task.cancel()
+                    try:
+                        await start_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                await indexer.stop()
                 # Commits are debounced; a clean stop must not leave a write on
                 # disk but out of git. gitstore also registers an atexit hook, so
                 # an unclean exit still gets one attempt.
