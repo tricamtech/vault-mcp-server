@@ -6,11 +6,12 @@ An MCP server that turns any folder of Markdown files into a searchable, structu
 
 ## What it does
 
-- **7 tools** exposed via MCP: `vault_list`, `vault_read`, `vault_write`, `vault_edit`, `vault_summary`, `vault_search`, `vault_reindex`
+- **9 tools** exposed via MCP: `vault_list`, `vault_read`, `vault_write`, `vault_edit`, `vault_summary`, `vault_search`, `vault_reindex`, `vault_links`, `vault_dangling_links`
 - **Semantic search** powered by ChromaDB + sentence-transformers — ask questions in natural language, get relevant chunks back instead of full files
 - **Metadata parsing** — extracts status, dates, and custom fields from `**Key:** Value` patterns in your Markdown
 - **Multilingual** — search and metadata work in English and Spanish out of the box
 - **Incremental indexing** — only re-embeds files that changed since last startup
+- **Link graph** — Obsidian-style `[[wiki-links]]` and markdown links become a queryable graph: backlinks, forward links, and links to notes that don't exist
 
 ## Why Markdown
 
@@ -130,12 +131,14 @@ If you're deploying behind Cloudflare (or any proxy that buffers SSE), you may h
 | Tool | Description |
 |------|-------------|
 | `vault_list` | List files with optional domain/status filters |
-| `vault_read` | Read a file with parsed metadata, sections, and cross-references |
+| `vault_read` | Read a file with parsed metadata, sections, cross-references, and backlinks |
 | `vault_write` | Create or overwrite a file |
 | `vault_edit` | String replacement edit (like Claude's Edit tool) |
 | `vault_summary` | Dashboard: file counts by domain, active projects, recent changes |
 | `vault_search` | Semantic search — returns relevant chunks, not full files |
 | `vault_reindex` | Force full re-index after external changes |
+| `vault_links` | Forward links and backlinks for one file (`direction`: `both`, `forward`, `backlinks`) |
+| `vault_dangling_links` | Links whose target file doesn't exist, grouped by missing target (`kind`: `wiki`, `markdown`, `all`; optional `source_prefix`) |
 
 ## Configuration
 
@@ -165,6 +168,7 @@ search:
 | `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers model |
 | `OAUTH_ISSUER_URL` | *(empty)* | Set to enable OAuth (e.g. `https://vault.yourdomain.com`) |
 | `OAUTH_PIN` | *(empty)* | Optional PIN for the OAuth approval page |
+| `VAULT_READ_BACKLINKS` | `true` | Show a **Referenced by:** line in `vault_read`. Set to `false`/`0`/`no`/`off` to disable |
 
 ## Metadata conventions
 
@@ -179,6 +183,23 @@ The server parses `**Key:** Value` patterns in the first 15 lines of each file:
 ```
 
 Recognized status values: `Active`, `Pending`, `Paused`, `Done` (and Spanish equivalents).
+
+## Wiki links
+
+The server understands Obsidian-style links:
+
+| Written as | Resolves to |
+|------------|-------------|
+| `[[note]]`, `[[note.md]]` | the file named `note.md` anywhere in the vault |
+| `[[projects/note]]` | `projects/note.md`, or any file whose path ends in `projects/note.md` |
+| `[[note\|label]]`, `[[note#Heading]]`, `![[note]]` | `note` (alias, heading and embed marker are ignored) |
+| `[text](../other.md)` | `other.md`, relative to the linking file |
+
+If several files share a basename, the shallowest path wins (then alphabetical), so a bare `[[note]]` always resolves the same way; use a path-style link to reach a specific one. Matching is exact first, then case-insensitive, and nothing fuzzier: `[[my_note]]` does not match `my-note.md`.
+
+Double brackets that are not links are ignored: anything inside code fences or inline code, shell tests like `[[ -f file ]]`, `[[ ! -d dir ]]` or `[[ a -lt b ]]`, and citation/JSON markup such as `[[^]]` or `[["a","b"]]`. Padding alone does not make a shell test: `[[ note ]]` is still a link to `note.md`.
+
+The graph is built on first use and cached until any `.md` file in the vault changes. `vault_read` never waits for a rebuild: if the cache is stale it omits the backlinks line and rebuilds in a background thread. Writes through `vault_write`/`vault_edit` trigger that rebuild immediately, so backlinks reappear without anyone having to call `vault_links`.
 
 ## Stack
 

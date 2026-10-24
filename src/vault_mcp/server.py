@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from starlette.requests import Request
 
 from .auth import CfAccessBypassMiddleware, SimpleOAuthProvider, create_approve_routes
 from .indexer import VaultIndexer
+from .linkgraph import build_link_graph, cached_link_graph, format_dangling, format_links
 from .parser import (
     extract_cross_references,
     extract_sections,
@@ -61,6 +63,13 @@ ALLOWED_HOSTS = [
     h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
 ]
 
+# Backlinks in vault_read cost one cached link-graph lookup (a stat walk, no
+# parsing). Kill switch because vault_read is the hottest tool and a nicety must
+# never be the reason a read gets slow.
+VAULT_READ_BACKLINKS = os.environ.get("VAULT_READ_BACKLINKS", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
 # ---------------------------------------------------------------------------
 # MCP Server (with optional OAuth)
 # ---------------------------------------------------------------------------
@@ -72,6 +81,8 @@ _mcp_kwargs: dict = dict(
         "Provides tools to list, read, write, edit, search, and summarize vault documents. "
         "Use vault_search for semantic queries across the vault — it returns only the "
         "relevant chunks instead of full files, saving tokens. "
+        "Use vault_links for a file's [[wiki-link]] backlinks and forward links, and "
+        "vault_dangling_links for links that point at files that do not exist. "
         "All file paths are relative to the vault root."
     ),
     host=SERVER_HOST,
@@ -124,6 +135,62 @@ def _list_md_files() -> list[str]:
             continue
         files.append(rel)
     return files
+
+
+_graph_refresh_lock = threading.Lock()
+_graph_refreshing = False
+
+
+def _schedule_link_graph_refresh():
+    """Rebuild the link graph off the request path, one refresh at a time.
+
+    Any write invalidates the cached graph. Without a refresh it would only warm
+    up again when somebody happened to call vault_links, so backlinks in
+    vault_read would vanish after every write and stay gone. With it they come
+    back as soon as the rebuild finishes, and no reader waits for the parse.
+    """
+    global _graph_refreshing
+    with _graph_refresh_lock:
+        if _graph_refreshing:
+            return
+        _graph_refreshing = True
+
+    def refresh():
+        global _graph_refreshing
+        try:
+            build_link_graph(VAULT_PATH)
+        except Exception:
+            logger.warning("link graph refresh failed", exc_info=True)
+        finally:
+            with _graph_refresh_lock:
+                _graph_refreshing = False
+
+    threading.Thread(target=refresh, name="linkgraph-refresh", daemon=True).start()
+
+
+def _backlinks_for(rel_path: str) -> list[str]:
+    """Files that link AT ``rel_path``.
+
+    Uses ``cached_link_graph``, never ``build_link_graph``: a full build parses
+    every file, and the cache is invalidated by any write, so building inline
+    would make the first read after every write pay for the whole vault. On a
+    miss this returns nothing and warms the graph in the background instead. A
+    backlink line that is occasionally absent is a fair price; a read that is
+    occasionally slow is not.
+
+    Never raises: a read must not fail because an ornament broke.
+    """
+    if not VAULT_READ_BACKLINKS:
+        return []
+    try:
+        graph = cached_link_graph(VAULT_PATH)
+        if graph is None:
+            _schedule_link_graph_refresh()
+            return []
+        return sorted({link.source for link in graph.backlinks_for(rel_path)})
+    except Exception:
+        logger.warning("backlinks unavailable for %s", rel_path, exc_info=True)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +252,7 @@ def vault_list(domain: str = "", status: str = "") -> str:
 
 @mcp.tool()
 def vault_read(file_path: str) -> str:
-    """Read a vault file with parsed metadata, sections, and cross-references.
+    """Read a vault file with parsed metadata, sections, cross-references and backlinks.
 
     Args:
         file_path: Path relative to vault root (e.g. "homeserver/homeserver-backlog.md").
@@ -217,6 +284,14 @@ def vault_read(file_path: str) -> str:
         header_parts.append(f"**Sections:** {', '.join(doc.sections[:15])}")
     if doc.cross_references:
         header_parts.append(f"**Cross-references:** {', '.join(doc.cross_references[:10])}")
+    backlinks = _backlinks_for(os.path.normpath(file_path).replace(os.sep, "/"))
+    if backlinks:
+        line = ", ".join(backlinks[:10])
+        if len(backlinks) > 10:
+            # Say so rather than cutting silently: a truncated list that looks
+            # complete is how "nothing else references this" gets believed.
+            line += f" ({len(backlinks)} total, showing 10)"
+        header_parts.append(f"**Referenced by:** {line}")
 
     # Extra raw metadata not already shown
     shown_keys = {"status", "estado", "creado", "created", "última actualización",
@@ -252,6 +327,7 @@ def vault_write(file_path: str, content: str) -> str:
 
     if indexer.is_ready:
         asyncio.create_task(indexer.index_file(file_path))
+    _schedule_link_graph_refresh()
 
     return f"Written: {file_path} ({len(content)} chars)"
 
@@ -287,6 +363,7 @@ def vault_edit(file_path: str, old_text: str, new_text: str) -> str:
 
     if indexer.is_ready:
         asyncio.create_task(indexer.index_file(file_path))
+    _schedule_link_graph_refresh()
 
     return f"Edited: {file_path} (replaced 1 occurrence)"
 
@@ -417,6 +494,49 @@ async def vault_reindex() -> str:
         f"Chunks indexed: {stats['chunks']}\n"
         f"Time: {stats['elapsed']:.1f}s"
     )
+
+
+@mcp.tool()
+def vault_links(file_path: str, direction: str = "both", limit: int = 50) -> str:
+    """Forward links and backlinks for one vault file.
+
+    Understands Obsidian-style [[wiki-links]] (with or without .md, by basename
+    or by path, with |alias or #heading) and markdown [text](file.md) links.
+
+    Args:
+        file_path: Vault path or link-style name, e.g. "projects/alpha.md",
+                   "projects/alpha" or just "alpha".
+        direction: "both" (default), "forward", or "backlinks".
+        limit: Maximum links listed per section (default 50, max 500).
+
+    Returns:
+        The file's outgoing links (dangling ones marked) and the files linking to it.
+    """
+    graph, resolver = build_link_graph(VAULT_PATH)
+    resolved = resolver.resolve(file_path)
+    if resolved is None:
+        return (
+            f"Error: file not found: {file_path}\n"
+            "(vault_links needs an existing file; use vault_dangling_links to see "
+            "links pointing at files that do not exist.)"
+        )
+    return format_links(graph, file_path, resolved, direction=direction, limit=min(max(limit, 1), 500))
+
+
+@mcp.tool()
+def vault_dangling_links(kind: str = "wiki", limit: int = 50, source_prefix: str = "") -> str:
+    """Links whose target file does not exist: stale renames or notes never written.
+
+    Args:
+        kind: "wiki" (default), "markdown", or "all".
+        limit: Maximum missing targets listed (default 50, max 500).
+        source_prefix: Only report links written in files under this path prefix.
+
+    Returns:
+        Missing targets grouped by name, most-referenced first, with the files that link to them.
+    """
+    graph, _resolver = build_link_graph(VAULT_PATH)
+    return format_dangling(graph, kind=kind, limit=min(max(limit, 1), 500), source_prefix=source_prefix)
 
 
 # ---------------------------------------------------------------------------
