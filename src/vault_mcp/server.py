@@ -12,6 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
+from . import gitstore
 from .auth import CfAccessBypassMiddleware, SimpleOAuthProvider, create_approve_routes
 from .indexer import VaultIndexer
 from .parser import (
@@ -249,11 +250,12 @@ def vault_write(file_path: str, content: str) -> str:
 
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(content, encoding="utf-8")
+    git = gitstore.commit_write(full_path, "vault_write", vault_rel_path=file_path)
 
     if indexer.is_ready:
         asyncio.create_task(indexer.index_file(file_path))
 
-    return f"Written: {file_path} ({len(content)} chars)"
+    return f"Written: {file_path} ({len(content)} chars){git.suffix()}"
 
 
 @mcp.tool()
@@ -284,11 +286,12 @@ def vault_edit(file_path: str, old_text: str, new_text: str) -> str:
 
     new_content = content.replace(old_text, new_text, 1)
     full_path.write_text(new_content, encoding="utf-8")
+    git = gitstore.commit_write(full_path, "vault_edit", vault_rel_path=file_path)
 
     if indexer.is_ready:
         asyncio.create_task(indexer.index_file(file_path))
 
-    return f"Edited: {file_path} (replaced 1 occurrence)"
+    return f"Edited: {file_path} (replaced 1 occurrence){git.suffix()}"
 
 
 @mcp.tool()
@@ -420,6 +423,32 @@ async def vault_reindex() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shutdown — flush debounced git commits
+# ---------------------------------------------------------------------------
+
+def _with_git_flush(lifespan):
+    """Wrap a lifespan so pending (debounced) git commits land on a clean stop.
+
+    gitstore also flushes from an atexit hook; this makes the clean-shutdown case
+    not depend on interpreter teardown order.
+    """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan_with_git_flush(app_instance):
+        try:
+            async with lifespan(app_instance) as state:
+                yield state
+        finally:
+            pending = gitstore.pending_summary()
+            if pending:
+                logger.info("flushing pending vault commits at shutdown: %s", pending)
+            await asyncio.to_thread(gitstore.flush_all)
+
+    return lifespan_with_git_flush
+
+
+# ---------------------------------------------------------------------------
 # Middleware — inject Accept header if missing (Claude Code compatibility)
 # ---------------------------------------------------------------------------
 
@@ -449,6 +478,7 @@ def main():
         mcp._custom_starlette_routes.extend(create_approve_routes(oauth_provider))
 
     app = mcp.streamable_http_app()
+    app.router.lifespan_context = _with_git_flush(app.router.lifespan_context)
     app.add_middleware(AcceptHeaderMiddleware)
 
     # If OAuth is enabled, add CF Access bypass (outermost middleware — runs first)
