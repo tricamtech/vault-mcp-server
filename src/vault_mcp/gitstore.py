@@ -92,14 +92,14 @@ GIT_DEBOUNCE_MAX_SECONDS = _env_float("VAULT_GIT_DEBOUNCE_MAX_SECONDS", 300.0)
 
 LOCK_FILENAME = "vault-mcp-commit.lock"
 
-_STATUS_OK = {"committed", "queued", "nochange", "untracked", "disabled"}
+_STATUS_OK = {"committed", "queued", "nochange", "untracked", "ignored", "disabled"}
 
 
 @dataclass(frozen=True)
 class CommitResult:
     """Outcome of the git half of a write. Never raised -- always returned."""
 
-    status: str  # committed | nochange | untracked | disabled | failed
+    status: str  # committed | queued | nochange | untracked | ignored | disabled | failed
     repo: Path | None = None
     commit: str | None = None
     detail: str = ""
@@ -124,6 +124,8 @@ class CommitResult:
             return " [git: queued]"
         if self.status == "untracked":
             return " [git: path not in a repo — not versioned]"
+        if self.status == "ignored":
+            return " [git: path is gitignored — not versioned]"
         if self.status == "disabled":
             return ""
         return f" [git: NOT COMMITTED — {self.detail or 'unknown error'}]"
@@ -209,6 +211,32 @@ def clear_repo_cache():
     """Drop memoized repo lookups (tests, or after the vault layout changes)."""
     with _repo_cache_lock:
         _repo_cache.clear()
+    with _thread_locks_guard:
+        _lock_paths.clear()
+
+
+_ignored_logged: set[str] = set()
+
+
+def _ignored(repo: Path, repo_rel: str) -> CommitResult | None:
+    """An ``ignored`` result when git ignores ``repo_rel``, else None.
+
+    ``git add`` refuses an ignored path outright, so without this every write to
+    one was reported as a failed commit and retried GIT_INDEX_RETRIES times --
+    and in a batch it failed every other path queued with it. Ignoring a path is
+    a deliberate choice, not an error: the write is on disk and ok, never
+    queued, and logged once per path. Tracked files are never reported ignored
+    by check-ignore, so a force-added file keeps being versioned.
+    """
+    if _git(repo, ["check-ignore", "-q", "--", repo_rel]).returncode != 0:
+        return None
+    key = f"{repo}:{repo_rel}"
+    with _repo_cache_lock:
+        first = key not in _ignored_logged
+        _ignored_logged.add(key)
+    if first:
+        logger.info("vault write to gitignored path, not versioned: %s in %s", repo_rel, repo)
+    return CommitResult(status="ignored", repo=repo, detail=repo_rel)
 
 
 # --------------------------------------------------------------------------
@@ -217,11 +245,37 @@ def clear_repo_cache():
 
 _thread_locks: dict[str, threading.Lock] = {}
 _thread_locks_guard = threading.Lock()
+_lock_paths: dict[str, Path] = {}
 
 
 def _thread_lock_for(repo: Path) -> threading.Lock:
     with _thread_locks_guard:
         return _thread_locks.setdefault(str(repo), threading.Lock())
+
+
+def _lock_path_for(repo: Path) -> Path:
+    """The commit lock file, inside the git dir that git itself reports.
+
+    Asked of git rather than assumed to be ``<repo>/.git``: in a linked worktree
+    or a submodule ``.git`` is a file, and the old fallback then dropped a stray
+    ``.vault-mcp-commit.lock`` into the work tree, where it showed up as
+    untracked. If git cannot say, the lock fails (and so the commit, loudly)
+    rather than littering the work tree.
+    """
+    key = str(repo)
+    with _thread_locks_guard:
+        if key in _lock_paths:
+            return _lock_paths[key]
+    proc = _git(repo, ["rev-parse", "--absolute-git-dir"])
+    git_dir = Path(proc.stdout.strip()) if proc.returncode == 0 and proc.stdout.strip() else None
+    if git_dir is None or not git_dir.is_dir():
+        raise RuntimeError(
+            f"cannot locate git dir for {repo}: {(proc.stderr or proc.stdout).strip()[:200]}"
+        )
+    path = git_dir / LOCK_FILENAME
+    with _thread_locks_guard:
+        _lock_paths[key] = path
+    return path
 
 
 class _RepoLock:
@@ -242,9 +296,7 @@ class _RepoLock:
         if not self._thread_lock.acquire(timeout=self.timeout):
             raise TimeoutError(f"timed out waiting for in-process commit lock on {self.repo}")
         try:
-            lock_dir = self.repo / ".git"
-            lock_path = lock_dir / LOCK_FILENAME if lock_dir.is_dir() else self.repo / f".{LOCK_FILENAME}"
-            self._fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            self._fd = os.open(str(_lock_path_for(self.repo)), os.O_CREAT | os.O_RDWR, 0o600)
             while True:
                 try:
                     fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -368,6 +420,10 @@ def _commit_write_inner(
             status="failed", repo=repo, detail=f"{real_path} is not inside {repo}"
         )
 
+    skipped = _ignored(repo, repo_rel)
+    if skipped is not None:
+        return skipped
+
     message = build_message(tool, [vault_rel_path or repo_rel], agent=agent)
     last_error = ""
 
@@ -384,7 +440,7 @@ def _commit_write_inner(
 
                 staged = _git(repo, ["diff", "--cached", "--quiet", "--", repo_rel])
                 if staged.returncode == 0:
-                    # Byte-identical rewrite (or an ignored path): nothing to record.
+                    # Byte-identical rewrite: nothing to record.
                     return CommitResult(status="nochange", repo=repo)
 
                 # Pathspec-scoped commit: records ONLY our file even if another
@@ -477,6 +533,10 @@ def _queue_write(
         return CommitResult(
             status="failed", repo=repo, detail=f"{real_path} is not inside {repo}"
         )
+
+    skipped = _ignored(repo, repo_rel)
+    if skipped is not None:
+        return skipped
 
     key = str(repo)
     with _batch_lock:

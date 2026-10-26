@@ -463,6 +463,25 @@ def _strip_code(content: str) -> str:
 
 _NOT_A_NOTE_NAME = re.compile(r'["$={}<>^`\\]')
 
+# Bash test operators, matched as whole space-delimited tokens (see _is_shell_test).
+_SHELL_TEST_OPERATOR = re.compile(r"\s(?:-eq|-ne|-lt|-le|-gt|-ge|-nt|-ot|-ef|==|!=|=~|&&|\|\|)\s")
+
+
+def _is_shell_test(raw: str) -> bool:
+    """Whether the text between ``[[`` and ``]]`` is a bash test, not a link.
+
+    Bash requires whitespace on both sides inside ``[[ ... ]]``, but padding
+    alone is not enough to tell: ``[[ note ]]`` is written as a link and must
+    still resolve. So padded text only counts as a test when it also looks like
+    one -- a unary test or negation (``[[ -f x ]]``, ``[[ ! -d y ]]``) or a binary
+    operator (``[[ a -lt b ]]``, ``[[ a || b ]]``). ``[[ -f x ]]`` was still a
+    dangling "-f x" after _NOT_A_NOTE_NAME (2026-10-26).
+    """
+    if not (raw[:1].isspace() and raw[-1:].isspace()):
+        return False
+    inner = raw.strip()
+    return inner.startswith(("-", "!")) or bool(_SHELL_TEST_OPERATOR.search(f" {inner} "))
+
 
 def extract_wiki_links(content: str) -> list[str]:
     """Extract unique ``[[wiki-link]]`` targets, alias and anchor stripped.
@@ -475,6 +494,10 @@ def extract_wiki_links(content: str) -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
     for raw in _WIKILINK_RE.findall(_strip_code(content)):
+        # Checked on the raw text, before the alias split: `[[ a || b ]]` would
+        # otherwise become a link to "a".
+        if _is_shell_test(raw):
+            continue
         target = raw.split("|", 1)[0].split("#", 1)[0].strip()
         if not target or "://" in target:
             continue
