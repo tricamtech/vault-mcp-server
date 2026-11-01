@@ -66,7 +66,7 @@ _search_config = _config.get("search", {})
 CHROMA_PATH = Path(os.environ.get("CHROMA_PATH", _search_config.get("chroma_path", "/app/chroma_data")))
 EMBEDDING_MODEL = os.environ.get(
     "EMBEDDING_MODEL",
-    _search_config.get("model", "paraphrase-multilingual-MiniLM-L12-v2"),
+    _search_config.get("model", "BAAI/bge-base-en-v1.5"),
 )
 
 OAUTH_ISSUER_URL = os.environ.get("OAUTH_ISSUER_URL", "")

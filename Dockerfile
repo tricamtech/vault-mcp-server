@@ -10,7 +10,7 @@ COPY pyproject.toml .
 RUN uv pip install --system .
 
 # Pre-download the embedding model (cached unless deps change)
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-base-en-v1.5')"
 
 # Copy source code last (changes here don't invalidate dep/model cache)
 COPY config.yaml .

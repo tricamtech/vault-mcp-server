@@ -151,7 +151,7 @@ server:
 
 search:
   chroma_path: "/app/chroma_data"
-  model: "paraphrase-multilingual-MiniLM-L12-v2"
+  model: "BAAI/bge-base-en-v1.5"
 ```
 
 ### Environment variables (override config.yaml)
@@ -162,7 +162,7 @@ search:
 | `SERVER_HOST` | `0.0.0.0` | Bind address |
 | `SERVER_PORT` | `8080` | Internal port |
 | `CHROMA_PATH` | `/app/chroma_data` | ChromaDB storage path |
-| `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformers model |
+| `EMBEDDING_MODEL` | `BAAI/bge-base-en-v1.5` | Sentence-transformers model |
 | `OAUTH_ISSUER_URL` | *(empty)* | Set to enable OAuth (e.g. `https://vault.yourdomain.com`) |
 | `OAUTH_PIN` | *(empty)* | Optional PIN for the OAuth approval page |
 
@@ -184,7 +184,7 @@ Recognized status values: `Active`, `Pending`, `Paused`, `Done` (and Spanish equ
 
 - **Python 3.12** + FastMCP
 - **ChromaDB** for vector storage
-- **sentence-transformers** (`paraphrase-multilingual-MiniLM-L12-v2`) for embeddings
+- **sentence-transformers** (`BAAI/bge-base-en-v1.5`) for embeddings
 - **Docker** + `uv` for fast builds
 
 ## License
