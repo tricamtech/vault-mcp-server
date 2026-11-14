@@ -413,7 +413,7 @@ def _queue_reindex(file_path: str):
     threadsafe`` is the one asyncio entry point that is safe to call from another
     thread, so the coroutine is handed to the loop that owns the indexer.
     """
-    if not indexer.is_ready:
+    if not indexer.is_ready():
         return
 
     coro = indexer.index_file(file_path)
@@ -1055,7 +1055,9 @@ def vault_summary() -> str:
     # is empty looks perfect in every section above and answers nothing.
     lines_out.append("\n## Search Index\n")
     rebuild = indexer.rebuild_status()
-    lines_out.append(f"  - ready: {indexer.is_ready}")
+    # is_ready is a METHOD; the un-called form printed a bound-method repr here
+    # and made every "if not indexer.is_ready" guard a no-op (always truthy).
+    lines_out.append(f"  - ready: {indexer.is_ready()}")
     lines_out.append(f"  - chunks indexed: {indexer.chunk_count()}")
     lines_out.append(f"  - rebuild state: {rebuild['state']}")
     if rebuild["state"] == "running":
@@ -1252,7 +1254,7 @@ async def vault_search(query: str, top_k: int = 10) -> str:
     When a file has further matching sections they are named; vault_read gives
     the whole file.
     """
-    if not indexer.is_ready:
+    if not indexer.is_ready():
         return "Indexing in progress. Please try again in a few seconds."
 
     top_k = min(max(top_k, 1), 20)
@@ -1392,7 +1394,7 @@ async def vault_reindex(force: bool = False) -> str:
             index the whole time, and it is replaced only once the new one is
             built and verified non-empty.
     """
-    if not indexer.is_ready:
+    if not indexer.is_ready():
         return "Indexing in progress. Please try again in a few seconds."
 
     if not force:
@@ -1431,7 +1433,7 @@ def vault_index_status() -> str:
     Tells running from succeeded from failed, so "no response" is never the
     signal. Also reports how many chunks the live index currently holds.
     """
-    if not indexer.is_ready:
+    if not indexer.is_ready():
         return "Indexing in progress. Please try again in a few seconds."
     return _format_index_status(indexer.rebuild_status())
 
