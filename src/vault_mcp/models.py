@@ -15,6 +15,15 @@ class Metadata:
     scope: Optional[str] = None
     sensitivity: Optional[str] = None
     tour: Optional[str] = None
+    # Schema 2026-11-13 (shared/fleet/vault-frontmatter-schema.md):
+    # `status` is document LIFECYCLE only; free-text project state lives in
+    # `progress`; `subject` is what the document is about (touring, fleet, ...),
+    # distinct from the path-derived storage `domain`; `as_of` is the date a
+    # person or the handoff stamper last verified the current content.
+    progress: Optional[str] = None
+    subject: Optional[str] = None
+    as_of: Optional[str] = None
+    superseded_by: Optional[str] = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -26,6 +35,10 @@ class VaultDocument:
     sections: list[str] = field(default_factory=list)  # header names
     cross_references: list[str] = field(default_factory=list)  # linked .md files
     wiki_links: list[str] = field(default_factory=list)  # [[wiki-link]] targets, raw
+    # Set when the file opens with `---` but the YAML between the fences does not
+    # parse. The parser then sees NO frontmatter at all (silently, before
+    # 2026-11-13); vault_summary now counts these so producers get fixed.
+    frontmatter_error: Optional[str] = None
 
 
 @dataclass

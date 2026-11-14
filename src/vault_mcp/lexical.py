@@ -171,6 +171,8 @@ class KeywordIndex:
                     "start_line": meta.get("start_line", 0),
                     "sensitivity": meta.get("sensitivity", ""),
                     "status": meta.get("status", ""),
+                    "doc_type": meta.get("doc_type", ""),
+                    "as_of": meta.get("as_of", ""),
                 })
         out.sort(key=lambda r: r["bm25"], reverse=True)
         return out[:limit]

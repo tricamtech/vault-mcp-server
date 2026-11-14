@@ -41,6 +41,7 @@ from .linkgraph import (
 )
 from .parser import (
     infer_domain,
+    is_known_status,
     parse_document,
     split_frontmatter,
 )
@@ -191,6 +192,10 @@ _FRONTMATTER_SHOWN_KEYS = {
     "updated_date",
     "ultima actualización",
     "última actualización",
+    "progress",
+    "subject",
+    "as_of",
+    "superseded_by",
 }
 
 
@@ -694,6 +699,16 @@ def _document_header(doc, backlinks: list[str] | None = None) -> list[str]:
     header_parts.append(f"**Domain:** {infer_domain(doc.path)}")
     if doc.metadata.status:
         header_parts.append(f"**Status:** {doc.metadata.status}")
+    if doc.metadata.progress:
+        header_parts.append(f"**Progress:** {doc.metadata.progress}")
+    if doc.metadata.as_of:
+        header_parts.append(f"**As of:** {doc.metadata.as_of}")
+    if doc.metadata.superseded_by:
+        header_parts.append(f"**Superseded by:** {doc.metadata.superseded_by}")
+    if doc.metadata.subject:
+        header_parts.append(f"**Subject:** {doc.metadata.subject}")
+    if doc.frontmatter_error:
+        header_parts.append(f"**Frontmatter:** INVALID ({doc.frontmatter_error}); metadata below is path-inferred only")
     if doc.metadata.created_date:
         header_parts.append(f"**Created:** {doc.metadata.created_date}")
     if doc.metadata.updated_date:
@@ -745,8 +760,16 @@ def vault_list(
     status: str = "",
     scope: str = "",
     sensitivity: str = "",
+    subject: str = "",
 ) -> str:
-    """List vault files with optional metadata filters."""
+    """List vault files with optional metadata filters.
+
+    `domain` is the storage partition derived from the path (bob, shared, tour =
+    legacy HANDOFF-* files only). `subject` is what a document is ABOUT
+    (touring, fleet, homelab, mtassist, business, personal, comms), from its
+    frontmatter or its directory. `status` is lifecycle (current, draft,
+    superseded, archived, historical) plus the legacy Active/Pending/Paused/Done.
+    """
     results: list[str] = []
     for rel_path in _list_md_files():
         doc = parse_document(VAULT_PATH, rel_path)
@@ -759,10 +782,16 @@ def vault_list(
             continue
         if sensitivity and (doc.metadata.sensitivity or "").lower() != sensitivity.lower():
             continue
+        if subject and (doc.metadata.subject or "").lower() != subject.lower():
+            continue
 
         labels: list[str] = []
         if doc.metadata.status:
             labels.append(doc.metadata.status)
+        if doc.metadata.subject:
+            labels.append(f"subject={doc.metadata.subject}")
+        if doc.metadata.as_of:
+            labels.append(f"as_of={doc.metadata.as_of}")
         if doc.metadata.scope:
             labels.append(f"scope={doc.metadata.scope}")
         if doc.metadata.sensitivity:
@@ -782,6 +811,8 @@ def vault_list(
         filters.append(f"scope={scope}")
     if sensitivity:
         filters.append(f"sensitivity={sensitivity}")
+    if subject:
+        filters.append(f"subject={subject}")
     header = f"Vault files ({len(results)})"
     if filters:
         header += " | " + ", ".join(filters)
@@ -877,8 +908,13 @@ def vault_upsert_section(file_path: str, section_header: str, content: str, leve
 
 
 @_tool(writes=True)
-def vault_create_handoff(file_path: str, title: str, body: str, tour: str = "", status: str = "Active") -> str:
-    """Create a standardized handoff document."""
+def vault_create_handoff(file_path: str, title: str, body: str, tour: str = "", status: str = "current") -> str:
+    """Create a standardized handoff document.
+
+    `status` is the document's lifecycle (current, draft, superseded, archived,
+    historical); the default was "Active" before 2026-11-13, which the schema
+    reserves for project state (`progress`), not documents.
+    """
     full_path = _resolve_markdown_path(file_path, allow_create=True)
     if full_path.exists():
         _fail(f"file already exists: {file_path}")
@@ -931,18 +967,32 @@ def vault_summary() -> str:
     """Dashboard summary of the vault — file counts by domain, status, and sensitivity."""
     files = _list_md_files()
     domain_counts: Counter[str] = Counter()
+    subject_counts: Counter[str] = Counter()
     status_counts: Counter[str] = Counter()
+    nonstandard_status: Counter[str] = Counter()
     sensitivity_counts: Counter[str] = Counter()
     active_projects: list[str] = []
+    in_progress: list[str] = []
+    malformed: list[str] = []
     file_mtimes: list[tuple[float, str]] = []
 
     for rel_path in files:
         doc = parse_document(VAULT_PATH, rel_path)
         domain_counts[infer_domain(rel_path)] += 1
+        if doc.metadata.subject:
+            subject_counts[doc.metadata.subject] += 1
+        if doc.frontmatter_error:
+            malformed.append(rel_path)
         if doc.metadata.status:
             status_counts[doc.metadata.status] += 1
+            if not is_known_status(doc.metadata.status):
+                nonstandard_status[doc.metadata.status] += 1
             if doc.metadata.status == "Active":
                 active_projects.append(f"  - {doc.metadata.title or Path(rel_path).stem} ({rel_path})")
+        if doc.metadata.progress:
+            in_progress.append(
+                f"  - {doc.metadata.title or Path(rel_path).stem} ({rel_path}): {doc.metadata.progress[:80]}"
+            )
         if doc.metadata.sensitivity:
             sensitivity_counts[doc.metadata.sensitivity] += 1
 
@@ -957,12 +1007,28 @@ def vault_summary() -> str:
     for domain, count in domain_counts.most_common():
         lines_out.append(f"  - {domain}: {count}")
 
+    if subject_counts:
+        lines_out.append("\n## By Subject\n")
+        for subject, count in subject_counts.most_common():
+            lines_out.append(f"  - {subject}: {count}")
+
     lines_out.append("\n## By Status\n")
     for status, count in status_counts.most_common():
         lines_out.append(f"  - {status}: {count}")
     unstated = len(files) - sum(status_counts.values())
     if unstated:
         lines_out.append(f"  - (no status): {unstated}")
+    if nonstandard_status:
+        total_ns = sum(nonstandard_status.values())
+        lines_out.append(
+            f"  - non-standard status values: {total_ns} files, {len(nonstandard_status)} distinct "
+            "(lifecycle vocabulary is current/draft/superseded/archived/historical; put project state in `progress`)"
+        )
+    if malformed:
+        lines_out.append(
+            f"  - INVALID frontmatter (opens with --- but YAML does not parse): {len(malformed)} files, "
+            f"e.g. {malformed[0]}"
+        )
 
     lines_out.append("\n## By Sensitivity\n")
     if sensitivity_counts:
@@ -974,6 +1040,10 @@ def vault_summary() -> str:
     if active_projects:
         lines_out.append(f"\n## Active Projects ({len(active_projects)})\n")
         lines_out.extend(active_projects[:20])
+
+    if in_progress:
+        lines_out.append(f"\n## With progress notes ({len(in_progress)})\n")
+        lines_out.extend(in_progress[:20])
 
     if file_mtimes:
         lines_out.append("\n## Recently Modified\n")
@@ -1099,18 +1169,44 @@ def _audit(event: dict) -> None:
 # scale, then multiplied by a freshness weight, then collapsed to one hit per file.
 _keyword_index = lexical.KeywordIndex()
 _KW_WEIGHT = float(os.environ.get("VAULT_KEYWORD_WEIGHT", "0.6"))
-_STALE_STATUSES = frozenset({"superseded", "archived", "deprecated", "retired", "obsolete", "closed"})
+_STALE_STATUSES = frozenset(
+    {"superseded", "archived", "historical", "deprecated", "retired", "obsolete", "closed"}
+)
 _DATE_IN_PATH = re.compile(r"(20\d\d)-(\d\d)-(\d\d)")
+_ISO_DATE = re.compile(r"^(20\d\d)-(\d\d)-(\d\d)")
 
 
-def _freshness_weight(path: str, status: str = "") -> float:
-    """Rank multiplier so current docs beat archived/superseded ones and old chat
-    transcripts that match about as well. It only REORDERS: nothing is dropped,
-    so asking about history still finds history."""
+def _current_state_is_fresh(doc_type: str, as_of: str) -> bool:
+    """A `type: current-state` document whose `as_of` is recent.
+
+    This is the ONLY ranking preference tied to a document's role (Cameron,
+    2026-11-13: no heading-keyword boosts). The current-state file is produced by
+    the CT122 handoff stamper from a reconciled CURRENT OPEN section and carries
+    the verification date; an old one gets no boost, so a stale stamp cannot
+    outrank a newer history block.
+    """
+    if str(doc_type).strip().lower() != "current-state":
+        return False
+    match = _ISO_DATE.match(str(as_of).strip())
+    if not match:
+        return False
+    try:
+        age = (datetime.now().date() - datetime(*map(int, match.groups())).date()).days
+    except ValueError:
+        return False
+    return 0 <= age <= int(os.environ.get("VAULT_CURRENT_STATE_MAX_AGE_DAYS", "30"))
+
+
+def _freshness_weight(path: str, status: str = "", doc_type: str = "", as_of: str = "") -> float:
+    """Rank multiplier so current docs beat archived/superseded/historical ones
+    and old chat transcripts that match about as well. It only REORDERS: nothing
+    is dropped, so asking about history still finds history."""
     lower = path.lower()
     weight = 1.0
     if "/archive" in lower or "archive-" in lower or str(status).strip().lower() in _STALE_STATUSES:
         weight *= float(os.environ.get("VAULT_ARCHIVE_WEIGHT", "0.8"))
+    if _current_state_is_fresh(doc_type, as_of):
+        weight *= float(os.environ.get("VAULT_CURRENT_STATE_WEIGHT", "1.15"))
     if "web-sessions/transcripts/" in lower:
         weight *= float(os.environ.get("VAULT_TRANSCRIPT_WEIGHT", "0.9"))
     match = _DATE_IN_PATH.search(lower)
@@ -1186,8 +1282,9 @@ async def vault_search(query: str, top_k: int = 10) -> str:
         key = (cand["path"], cand["section"], cand["start_line"])
         entry = merged.setdefault(key, {**cand, "sem": None, "kw": 0.0})
         entry["kw"] = cand["bm25"] / best_kw
-        if not entry.get("status"):
-            entry["status"] = cand.get("status", "")
+        for field in ("status", "doc_type", "as_of"):
+            if not entry.get(field):
+                entry[field] = cand.get(field, "")
     for entry in merged.values():
         sem_part = ((entry["sem"] - floor) / span) if entry["sem"] is not None else 0.0
         entry["fused"] = sem_part + _KW_WEIGHT * entry["kw"]
@@ -1197,7 +1294,12 @@ async def vault_search(query: str, top_k: int = 10) -> str:
         by_path.setdefault(entry["path"], []).append(entry)
     ranked = sorted(
         by_path.items(),
-        key=lambda item: item[1][0]["fused"] * _freshness_weight(item[0], item[1][0].get("status", "")),
+        key=lambda item: item[1][0]["fused"] * _freshness_weight(
+            item[0],
+            item[1][0].get("status", ""),
+            item[1][0].get("doc_type", ""),
+            item[1][0].get("as_of", ""),
+        ),
         reverse=True,
     )
     results: list[dict] = []
@@ -1228,6 +1330,10 @@ async def vault_search(query: str, top_k: int = 10) -> str:
         meta_bits = [f"**File:** {result['path']}", f"**Score:** {score_text}", f"**Matched by:** {result['via']}"]
         if result.get("sensitivity"):
             meta_bits.append(f"**Sensitivity:** {result['sensitivity']}")
+        if result.get("status"):
+            meta_bits.append(f"**Status:** {result['status']}")
+        if result.get("as_of"):
+            meta_bits.append(f"**As of:** {result['as_of']}")
         parts.append("  |  ".join(meta_bits))
         parts.append(f"```markdown\n{result['content']}\n```")
         more = list(dict.fromkeys(also[result["path"]]))

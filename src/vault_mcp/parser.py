@@ -29,12 +29,27 @@ _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 # Header pattern.
 _HEADER_RE = re.compile(r"^(#{1,4})\s+(.+)", re.MULTILINE)
 
-# Status normalization mapping.
+# Document lifecycle vocabulary (schema 2026-11-13). `status` means ONLY where a
+# document is in its life; "what is the project up to" belongs in `progress`.
+LIFECYCLE_STATUSES: frozenset[str] = frozenset(
+    {"current", "draft", "superseded", "archived", "historical"}
+)
+
+# Status normalization: EXACT match on the whole (lower-cased, stripped) value.
+# Until 2026-11-13 this was a substring scan, so `draft` became Active, `inactive`
+# became Active, and any prose containing "done" became Done. Lifecycle words map
+# to themselves; the legacy project words keep their legacy capitalised form so
+# existing filters (`vault_list(status="Active")`, memory-api) keep working.
 _STATUS_MAP: dict[str, str] = {
+    "current": "current",
+    "draft": "draft",
+    "superseded": "superseded",
+    "archived": "archived",
+    "archive": "archived",
+    "historical": "historical",
     "active": "Active",
     "activo": "Active",
     "en progreso": "Active",
-    "draft": "Active",
     "🟡": "Active",
     "pending": "Pending",
     "pendiente": "Pending",
@@ -46,6 +61,29 @@ _STATUS_MAP: dict[str, str] = {
     "completado": "Done",
     "completed": "Done",
     "🟢": "Done",
+}
+
+# Everything normalize_status can return on purpose. Anything else is a
+# non-standard value that passes through verbatim and is counted by vault_summary.
+KNOWN_STATUSES: frozenset[str] = frozenset(_STATUS_MAP.values())
+
+# Subject = what the document is about, defaulted from its directory. Distinct
+# from `domain`, which is the path-derived storage partition and is unchanged.
+SUBJECTS: frozenset[str] = frozenset(
+    {"touring", "fleet", "homelab", "mtassist", "business", "personal", "comms"}
+)
+_SUBJECT_BY_DIR: dict[str, str] = {
+    "shared/tours": "touring",
+    "shared/tour-cache": "touring",
+    "shared/fleet": "fleet",
+    "shared/handoffs": "fleet",
+    "shared/skills": "fleet",
+    "shared/homelab": "homelab",
+    "shared/mtassist": "mtassist",
+    "shared/mastertour": "mtassist",
+    "shared/business": "business",
+    "shared/personal": "personal",
+    "shared/comms": "comms",
 }
 
 # Metadata key normalization across YAML and legacy inline markdown.
@@ -67,29 +105,46 @@ _KEY_MAP: dict[str, str] = {
     "sensitivity": "sensitivity",
     "tour": "tour",
     "tags": "tags",
+    "progress": "progress",
+    "subject": "subject",
+    "as_of": "as_of",
+    "as of": "as_of",
+    "superseded_by": "superseded_by",
+    "superseded by": "superseded_by",
 }
 
 _SEMANTIC_INDEX_BLOCKLIST = {"restricted", "secret"}
 _SENSITIVITY_ORDER = {"": 0, "restricted": 1, "secret": 2}
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 
+# Filename hints per tour code, taken from shared/tour-registry.md (Aliases +
+# Memory Files) on 2026-11-13. The previous table named the wrong artists for
+# jk / oa / ct and a tour (ct) that is not in the registry.
 _TOUR_HINTS: dict[str, tuple[str, ...]] = {
-    "bb": ("bacon-brothers", "bb-salk"),
-    "ct": ("celtic-thunder",),
-    "jk": ("john-kim",),
-    "ll": ("lyle-lovett", "touradmin-japan"),
-    "mp": ("martin-pixie", "mp-canada", "touradmin-canada"),
-    "oa": ("old-97s",),
+    "bb": ("bacon-brothers", "bacon", "bb-salk"),
+    "jk": ("jonah-kagen", "jonah", "kagen"),
+    "ll": ("lisa-loeb", "loeb", "ll-shames", "shames", "touradmin-japan"),
+    "mp": ("madeleine-peyroux", "peyroux", "mp-canada", "touradmin-canada"),
+    "oa": ("oliver-anthony",),
     "yola": ("yola",),
 }
 
+# Path overrides. Sensitivity is meant to live in each file's own
+# `sensitivity:` frontmatter (schema 2026-11-13); the entries here are a backstop
+# for the four personal/ops files that carry it, and the only mechanism for the
+# MEMORY.md mirrors, which are copies of files owned elsewhere. The eight
+# `shared/reference/*` entries that used to exclude services.md, homeassistant.md,
+# homelab.md, quick-reference.md, gmail-management.md, memory-non-tour.md,
+# bob-agent.md and shesynergy.md keyed on paths that stopped existing when
+# reference/ was dissolved; Cameron (2026-11-13) chose to keep those eight
+# searchable after a raw-secret scan found only keychain entry NAMES in them.
 _PATH_OVERRIDES: dict[str, dict[str, str]] = {
     "shared/people.cameron.md": {
         "scope": "personal",
         "doc_type": "person",
         "sensitivity": "restricted",
     },
-    "shared/reference/people.cameron.full.md": {
+    "shared/personal/people.cameron.full.md": {
         "scope": "personal",
         "doc_type": "person",
         "sensitivity": "restricted",
@@ -98,52 +153,12 @@ _PATH_OVERRIDES: dict[str, dict[str, str]] = {
         "scope": "personal",
         "doc_type": "reference",
     },
-    "shared/actual-budget.md": {
+    "shared/personal/actual-budget.md": {
         "scope": "personal",
         "doc_type": "finance",
         "sensitivity": "restricted",
     },
-    "shared/reference/services.md": {
-        "scope": "ops",
-        "doc_type": "reference",
-        "sensitivity": "restricted",
-    },
-    "shared/reference/homeassistant.md": {
-        "scope": "ops",
-        "doc_type": "reference",
-        "sensitivity": "restricted",
-    },
-    "shared/reference/homelab.md": {
-        "scope": "ops",
-        "doc_type": "reference",
-        "sensitivity": "restricted",
-    },
-    "shared/reference/quick-reference.md": {
-        "scope": "ops",
-        "doc_type": "reference",
-        "sensitivity": "restricted",
-    },
-    "shared/reference/gmail-management.md": {
-        "scope": "ops",
-        "doc_type": "reference",
-        "sensitivity": "restricted",
-    },
-    "shared/reference/memory-non-tour.md": {
-        "scope": "ops",
-        "doc_type": "reference",
-        "sensitivity": "restricted",
-    },
-    "shared/reference/bob-agent.md": {
-        "scope": "ops",
-        "doc_type": "reference",
-        "sensitivity": "restricted",
-    },
-    "shared/reference/shesynergy.md": {
-        "scope": "ops",
-        "doc_type": "reference",
-        "sensitivity": "restricted",
-    },
-    "shared/nanostation-camera-bridge.md": {
+    "shared/homelab/nanostation-camera-bridge.md": {
         "scope": "ops",
         "doc_type": "reference",
         "sensitivity": "restricted",
@@ -172,12 +187,51 @@ _PATH_OVERRIDES: dict[str, dict[str, str]] = {
 
 
 def normalize_status(raw: Any) -> str:
-    """Normalize status strings and emojis to standard vocabulary."""
-    cleaned = str(raw).strip().lower()
-    for token, normalized in _STATUS_MAP.items():
-        if token in cleaned:
-            return normalized
-    return str(raw).strip()
+    """Normalize a status value to the standard vocabulary.
+
+    Exact match on the whole value (case-insensitive). Unknown values pass
+    through verbatim: ``inactive`` stays ``inactive`` and prose stays prose,
+    instead of a substring hit turning either into ``Active``.
+    """
+    cleaned = str(raw).strip()
+    return _STATUS_MAP.get(cleaned.lower(), cleaned)
+
+
+def is_known_status(value: Any) -> bool:
+    """Whether a (normalized) status is one the vocabulary defines."""
+    return str(value).strip() in KNOWN_STATUSES
+
+
+def frontmatter_error(content: str) -> str | None:
+    """Why a document that opens with ``---`` has unusable frontmatter, or None.
+
+    ``split_frontmatter`` returns ``{}`` for a YAML error so the rest of the
+    parser keeps working; this names the problem so vault_summary can count it.
+    63 tour-cache files were silently metadata-less this way (2026-11-13).
+    """
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() != "---":
+            continue
+        try:
+            parsed = yaml.safe_load("\n".join(lines[1:idx]))
+        except yaml.YAMLError as exc:
+            first = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+            return f"yaml: {first}"
+        if parsed is not None and not isinstance(parsed, dict):
+            return f"yaml: frontmatter is a {type(parsed).__name__}, not a mapping"
+        return None
+    return "unterminated frontmatter (opening --- without a closing ---)"
+
+
+def infer_subject(rel_path: str) -> str | None:
+    """Directory default for `subject`, or None when the directory implies nothing."""
+    parts = Path(rel_path.replace("\\", "/")).parts
+    if len(parts) > 2:
+        return _SUBJECT_BY_DIR.get("/".join(parts[:2]))
+    return None
 
 
 def normalize_tags(value: Any) -> list[str]:
@@ -257,6 +311,19 @@ def _apply_metadata_key(meta: Metadata, key_raw: str, value: Any):
         meta.sensitivity = normalize_sensitivity(value)
     elif key_norm == "tour":
         meta.tour = str(value).strip()
+    elif key_norm == "progress":
+        meta.progress = str(value).strip()
+    elif key_norm == "subject":
+        # Vocabulary only. Cached email-thread files already carry a `subject:`
+        # that is the MAIL subject ("Monitor engineer for Sept 6th show"); those
+        # stay in `raw` and the directory default applies (4 files, 2026-11-13).
+        candidate = str(value).strip().lower()
+        if candidate in SUBJECTS:
+            meta.subject = candidate
+    elif key_norm == "as_of":
+        meta.as_of = str(value).strip()
+    elif key_norm == "superseded_by":
+        meta.superseded_by = str(value).strip()
 
 
 def _infer_tour(rel_path: str) -> str | None:
@@ -370,17 +437,28 @@ def apply_path_inference(meta: Metadata, rel_path: str):
         meta.doc_type = inferred["doc_type"]
     if inferred.get("tour") and not meta.tour:
         meta.tour = inferred["tour"]
+    if not meta.subject:
+        meta.subject = infer_subject(rel_path)
     meta.sensitivity = _stronger_sensitivity(meta.sensitivity, inferred.get("sensitivity"))
 
 
 def parse_metadata(lines: list[str], frontmatter: dict[str, Any] | None = None) -> Metadata:
-    """Extract normalized metadata from frontmatter and early markdown body lines."""
+    """Extract normalized metadata from frontmatter and early markdown body lines.
+
+    Frontmatter is authoritative. A ``**Status:** ...`` line in the first 20
+    body lines used to OVERWRITE the YAML status (16 files showed prose or the
+    wrong lifecycle because of it, 2026-11-13). Now: when YAML already states a
+    status, the body line is read as ``progress``; when YAML has none, the body
+    line is the status only if it normalizes to a known value, otherwise it is
+    ``progress`` and the document has no lifecycle status.
+    """
     meta = Metadata(raw={})
     frontmatter = frontmatter or {}
 
     for key, value in frontmatter.items():
         meta.raw[str(key)] = value
         _apply_metadata_key(meta, str(key), value)
+    yaml_status = meta.status
 
     for line in lines[:20]:
         match = _META_RE.search(line)
@@ -388,6 +466,18 @@ def parse_metadata(lines: list[str], frontmatter: dict[str, Any] | None = None) 
             continue
         key_raw = match.group(1).strip()
         value = match.group(2).strip()
+        if _KEY_MAP.get(key_raw.lower()) == "status":
+            meta.raw.setdefault(key_raw, value)
+            if yaml_status is not None:
+                if not meta.progress:
+                    meta.progress = value
+                continue
+            normalized = normalize_status(value)
+            if is_known_status(normalized):
+                meta.status = normalized
+            elif not meta.progress:
+                meta.progress = value
+            continue
         meta.raw[key_raw] = value
         _apply_metadata_key(meta, key_raw, value)
 
@@ -534,6 +624,7 @@ def parse_document(vault_root: Path, rel_path: str) -> VaultDocument:
         sections=sections,
         cross_references=cross_refs,
         wiki_links=wiki_links,
+        frontmatter_error=frontmatter_error(content) if not frontmatter else None,
     )
 
 

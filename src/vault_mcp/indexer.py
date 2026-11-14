@@ -678,6 +678,8 @@ class VaultIndexer:
                 "start_line": meta.get("start_line", 0),
                 "sensitivity": meta.get("sensitivity", ""),
                 "status": meta.get("status", ""),
+                "doc_type": meta.get("doc_type", ""),
+                "as_of": meta.get("as_of", ""),
             })
 
         return output
@@ -811,6 +813,10 @@ class VaultIndexer:
                 # Freshness ranking (server._freshness_weight) demotes superseded docs.
                 "status": str(document.metadata.status or ""),
                 "updated": str(document.metadata.updated_date or ""),
+                # Fresh `type: current-state` docs get a small rank boost
+                # (server._current_state_is_fresh); both fields ride on the chunk.
+                "as_of": str(document.metadata.as_of or ""),
+                "subject": str(document.metadata.subject or ""),
             })
 
         # Upsert to ChromaDB
